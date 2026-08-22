@@ -8,6 +8,9 @@
   "blockedPath": "logs/blocked.md",
   "promptPath": ".harness-prompt.md",
 
+  "persistentSession": true,
+  "rotateCtxTokens": 120000,
+
   "intervalSec": 900,
   "maxUnits": 8,
   "maxCtxWarnTokens": 70000,

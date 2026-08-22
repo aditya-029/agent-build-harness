@@ -1,6 +1,12 @@
 # Proposal: make the session you talk to the session that builds
 
-**Status:** proposed, not implemented. Raised by Aditya 2026-08-22.
+**Status: IMPLEMENTED 2026-08-22.** Shipped as `persistentSession` (default on) plus
+`harness chat`. Raised by Aditya, who described the problem exactly and whose phrasing —
+"a Claude Code chat" — produced a better design than the one first proposed here: the section
+below originally called for a custom REPL fed over stdin. That turned out to be unnecessary.
+A headless session writes an ordinary transcript, so the orchestrator can just be resumed
+interactively and you get the genuine TUI for free. The stdin/streaming design is kept below
+because its `steer` verb (interrupt mid-turn) is still worth having and is not yet built.
 **Problem:** the harness spawns a fresh one-shot `claude -p` per tick, so there is no session
 to talk *to*. Steering it means opening a second interactive Claude Code session that reads
 logs and runs `harness say` on your behalf — a middle man between you and the build.

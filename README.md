@@ -9,7 +9,8 @@ Zero dependencies. Node ≥ 22 and the `claude` CLI are the whole install.
 ```
 harness install     # write the launchd job
 harness start       # arm it
-harness ui          # live dashboard at :4317
+harness chat        # TALK TO IT — the real Claude Code TUI, on the session
+                    # the scheduler is driving. No second session, no relay.
 harness status      # one screen: usage, budget, cooldown, next tick
 ```
 
@@ -31,6 +32,46 @@ real sessions:
 Every threshold in `src/harness.mjs` carries a comment recording what it was, what it is,
 and what measurement changed it. The interesting parts of this repo are those comments.
 
+## One orchestrator you can talk to
+
+Most unattended harnesses spawn a fresh agent per tick and let it exit. That leaves nothing
+to *address*: to steer the build you open a **second** interactive session that reads the
+logs and relays on your behalf — a translator between you and your own agent.
+
+This one keeps a single orchestrator conversation. Every tick resumes it, so context carries
+over and no tick pays a cold start. And because a headless session writes an ordinary
+transcript to `~/.claude/projects`, the same place an interactive one does, you can simply
+resume it yourself:
+
+```
+$ harness chat
+attaching to the orchestrator (1d9f1792) — the same session the scheduler drives
+scheduler is held off while you are attached. Exit to hand it back.
+```
+
+That is the **real Claude Code TUI**, with its slash commands and its full history, on the
+exact conversation the scheduler has been driving. Nothing here proxies or reimplements the
+interface — `stdio` is inherited and the child owns your terminal.
+
+The scheduler and the keyboard are mutually exclusive: a tick will not run while you are
+attached, and `chat` refuses to start on top of a running tick. Two writers on one transcript
+would interleave the conversation into nonsense. A crashed `chat` cannot wedge the scheduler,
+because the marker carries a PID that is checked for liveness.
+
+Measured on two consecutive ticks against the same repo:
+
+```
+tick 1  new session   $0.0277   2 turns    ← cold start: read the brief, orient
+tick 2  resumed       $0.0063   1 turn     ← already knew where it was
+```
+
+**Rotation.** Persistence must not defeat the context discipline the rest of the harness
+enforces. Past `rotateCtxTokens` the conversation is retired and the next tick opens a fresh
+one, which re-orients from the journal line the old one wrote. The conversation is a stable
+address; the session behind it rotates, and `harness chat` never has to know which is live.
+
+Set `"persistentSession": false` to go back to spawn-per-tick.
+
 ## What it does
 
 | | |
@@ -43,6 +84,7 @@ and what measurement changed it. The interesting parts of this repo are those co
 | **Re-pins rules after compaction** | a summary is a claim, not evidence; the non-negotiables are re-injected through `PreToolUse`, which actually reaches a running session |
 | **Backs off when idle** | the wait doubles for every session that ships nothing, so an empty backlog stops costing money |
 | **Observes** | a live dashboard with the agent tree, and a message channel — `harness say "..."` reaches the running session |
+| **Talks back** | `harness chat` opens the real Claude Code TUI on the orchestrator's own session — see above |
 
 ## Install
 
@@ -136,7 +178,7 @@ the privilege of rediscovering there is no work, sooner.
 ## Tests
 
 ```bash
-npm test          # 198 assertions
+npm test          # 207 assertions
 npm run test:stress
 ```
 

@@ -891,6 +891,61 @@ console.log('\n── Buying through a spent 5-hour window')
   fs.rmSync(usageLog, { force: true })
 }
 
+console.log('\n── Orchestrator session and `chat`')
+{
+  const ORCH = path.join(STATE, 'orchestrator_session')
+  const ATTACHED = path.join(STATE, 'attached')
+  const LOCK = path.join(STATE, 'run.lock')
+  const clean = () => { for (const f of [ORCH, ATTACHED, LOCK]) fs.rmSync(f, { force: true }) }
+  clean()
+
+  // A live child to own the PIDs under test. `sleep` is portable and cheap.
+  const live = (await import('node:child_process')).spawn('sleep', ['30'], { stdio: 'ignore' })
+  const LIVEPID = String(live.pid)
+
+  ok('status reports no orchestrator before the first tick',
+    /orchestrator none yet/.test(run(['status']).out))
+
+  // ── chat refuses to race a tick ──
+  fs.writeFileSync(LOCK, LIVEPID)
+  const racing = run(['chat'])
+  ok('chat refuses while a tick is running', /a tick is running right now/.test(racing.out + (racing.err || '')))
+  ok('and it does not claim the attach marker on the way out', !fs.existsSync(ATTACHED))
+  fs.rmSync(LOCK, { force: true })
+
+  // ── chat refuses a second keyboard ──
+  fs.writeFileSync(ATTACHED, LIVEPID)
+  const second = run(['chat'])
+  ok('chat refuses a second attach', /already attached/.test(second.out + (second.err || '')))
+
+  // ── the tick refuses to type into an attached session ──
+  // This is the one that matters: two writers on one transcript corrupts the
+  // conversation, and the scheduler is the one that must yield.
+  const ticked = run(['tick'])
+  const log = (() => { try { return fs.readFileSync(path.join(STATE, 'run.log'), 'utf8') } catch { return '' } })()
+  ok('a tick will not run into an attached session',
+    /attached in .*harness chat/.test(log + ticked.out))
+
+  // ── a dead PID must not wedge the scheduler forever ──
+  fs.writeFileSync(ATTACHED, '999999')
+  run(['status'])
+  ok('a stale attach marker is cleared rather than honoured', !fs.existsSync(ATTACHED))
+
+  // ── an id whose transcript is gone must degrade, not throw ──
+  fs.writeFileSync(ORCH, '00000000-0000-4000-8000-000000000000')
+  const orphan = run(['status'])
+  ok('an orchestrator id with no transcript reads as none',
+    /orchestrator none yet/.test(orphan.out), orphan.out.slice(0, 120))
+  ok('and status still exits cleanly', orphan.code === 0)
+
+  // ── a malformed id must not be passed to --resume ──
+  fs.writeFileSync(ORCH, 'not-a-session-id')
+  ok('a malformed orchestrator id is rejected', /orchestrator none yet/.test(run(['status']).out))
+
+  live.kill()
+  clean()
+}
+
 console.log('\n── Sandbox containment')
 {
   ok('sandbox state exists', fs.existsSync(STATE))

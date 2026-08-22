@@ -7,6 +7,8 @@
 //   harness <command>            (with HARNESS_REPO set, or run inside the repo)
 //
 //     tick            run one build session   (launchd calls this)
+//     chat            TALK TO THE ORCHESTRATOR — opens the real Claude Code
+//                     TUI on the very session the scheduler drives
 //     hook            Claude Code hook target (settings.json calls this)
 //     ui              live dashboard + message channel
 //     say <message>   send a message to the running agent
@@ -202,6 +204,36 @@ const CONFIG = {
   // The build brief handed to each session. Repo-relative, or absolute.
   promptPath: pick('promptPath', process.env.HARNESS_PROMPT, '.harness-prompt.md'),
 
+  // ── ONE ORCHESTRATOR, NOT ONE AGENT PER TICK ────────────────────────────
+  //
+  // Originally every tick spawned a fresh `claude -p`, did a unit, and let it
+  // exit. Two things were wrong with that, and they turned out to be the same
+  // thing:
+  //
+  //   1. Every tick paid a cold start — re-read the project file, the log, the
+  //      tree — before doing any work. That is most of what an idle session
+  //      costs and a large slice of a working one.
+  //   2. There was no session to ADDRESS. `say` could nudge a running one
+  //      through the hook, but it could not reply and between ticks nothing was
+  //      running at all. So steering the build meant opening a SECOND
+  //      interactive session to read the logs and relay on your behalf. That
+  //      middle man was the only component in the system with no reason to be.
+  //
+  // Now one session persists and every tick resumes it. A headless session
+  // writes an ordinary transcript to ~/.claude/projects, which means
+  // `harness chat` can open the REAL Claude Code TUI on the very conversation
+  // the scheduler is driving. No custom REPL, no relay, no second session.
+  //
+  // Set false to restore the old spawn-per-tick behaviour.
+  persistentSession: PROJECT.persistentSession !== false && process.env.PERSISTENT_SESSION !== '0',
+
+  // Context at which the orchestrator session is retired and a fresh one
+  // seeded from the journal. Persistence must not be allowed to defeat the
+  // context discipline the rest of this file is built around — see
+  // maxCtxHandoffTokens. The CONVERSATION is a stable address; the SESSION
+  // behind it rotates, and `harness chat` never has to know which one is live.
+  rotateCtxTokens: num(pick('rotateCtxTokens', process.env.ROTATE_CTX, 120_000)),
+
   // Rules re-injected verbatim after a context compaction, on top of the
   // generic ones below. These are the project's OWN non-negotiables — the
   // things that are both forbidden and invisible in a diff. Keep the list
@@ -258,6 +290,12 @@ const P = {
   // Consecutive sessions that committed nothing but bookkeeping. Reset to 0 by
   // the first session that ships anything. Drives the idle backoff.
   idleStreak: path.join(STATE, 'idle_streak'),
+  // The durable orchestrator conversation. Survives ticks, survives the harness
+  // process dying, and is what `harness chat` attaches to.
+  orchestrator: path.join(STATE, 'orchestrator_session'),
+  // Held while a human is attached via `harness chat`. Two processes writing one
+  // session transcript would corrupt it, so the tick refuses to run behind it.
+  attached: path.join(STATE, 'attached'),
   // Session id of the tick currently in flight. The inbox is repo-global and
   // ANY Claude Code session in this tree runs the same PreToolUse hook, so
   // without this an interactive session sitting in the repo drains messages
@@ -315,6 +353,35 @@ function gitChangedPaths(from, to) {
       { cwd: REPO, encoding: 'utf8', stdio: 'pipe' })
     return out.split('\n').map(x => x.trim()).filter(Boolean)
   } catch { return null }
+}
+
+// ── the orchestrator conversation ─────────────────────────────────────────
+//
+// A session id is only usable if its transcript still exists — Claude Code
+// stores one .jsonl per session under a directory named for the cwd. Resuming
+// an id whose transcript has been deleted fails the whole tick, so an id that
+// cannot be proven live is discarded and a new session started instead.
+function transcriptPath(sid) {
+  const dir = REPO.replace(/[/.]/g, '-')
+  return path.join(os.homedir(), '.claude', 'projects', dir, `${sid}.jsonl`)
+}
+
+function readOrchestrator() {
+  let sid
+  try { sid = fs.readFileSync(P.orchestrator, 'utf8').trim() } catch { return null }
+  if (!/^[0-9a-f-]{36}$/i.test(sid)) return null
+  // Not finding the transcript is normal after a `claude` data reset, and must
+  // degrade to "start a fresh session", never to a failed tick.
+  return exists(transcriptPath(sid)) ? sid : null
+}
+const writeOrchestrator = sid => { ensureDirs(); fs.writeFileSync(P.orchestrator, sid) }
+
+// A human is at the keyboard in `harness chat`. The marker carries the PID so a
+// crashed chat cannot wedge the scheduler forever.
+function attachedPid() {
+  const pid = readInt(P.attached)
+  if (!pid) return 0
+  try { process.kill(pid, 0); return pid } catch { fs.rmSync(P.attached, { force: true }); return 0 }
 }
 
 const readIdleStreak = () => readInt(P.idleStreak)
@@ -646,6 +713,11 @@ async function cmdTick() {
   ensureDirs()
   if (exists(P.stopped)) { logLine('stop marker present — unloading launchd'); cmdStop(); return }
   if (exists(P.paused)) { logLine('paused — skipping'); return }
+  // Never run a tick into a session a human is typing into. Both processes
+  // would append to the same transcript and the conversation would interleave
+  // into nonsense. The human wins; the scheduler comes back next interval.
+  const who = attachedPid()
+  if (who) { logLine(`attached in \`harness chat\` (pid ${who}) — skipping`); return }
 
   // A lock held by THIS process is not a concurrent tick — it is our own from a
   // previous pass. Only an exit handler used to clear it, which is correct for
@@ -720,9 +792,23 @@ async function cmdTick() {
   // produced "…143051..jsonl".
   const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
   const runLogPath = path.join(P.runs, `${stamp}.jsonl`)
-  const sessionId = randomUUID()
+  // Resume the orchestrator if there is one, otherwise open a new conversation.
+  // `--resume` reuses the id, so `sessionId` is right either way.
+  const resuming = CONFIG.persistentSession ? readOrchestrator() : null
+  const sessionId = resuming || randomUUID()
 
-  const prompt = `${fs.readFileSync(P.prompt, 'utf8')}
+  // A resumed orchestrator already HAS the brief in its context. Re-sending it
+  // every tick would re-pay for it and, worse, read as a fresh instruction to
+  // start over — the agent would re-orient instead of continuing. A resumed
+  // tick therefore gets a short continuation turn and the live meter only.
+  const prompt = resuming ? `[scheduler] Next unit. You are the same session as before — do NOT
+re-orient from scratch, and do not re-read what you already know. Pick up from
+the "next" value you last wrote and continue.
+
+${meterPreamble()}
+
+SESSION BUDGET: ${CONFIG.maxUnits} unit(s), and the context ceiling still applies.
+Stop cleanly and write the journal line when you reach either.` : `${fs.readFileSync(P.prompt, 'utf8')}
 
 ${meterPreamble()}
 
@@ -772,11 +858,16 @@ before stopping — it is the only thing that survives you.`
   if (dropped) logLine(`dropped ${dropped} stale supervisor nudge(s) from a prior session`)
 
   fs.writeFileSync(P.currentSession, sessionId)
-  logLine(`starting tick — session ${sessionId}, max ${CONFIG.maxUnits} unit(s)`)
+  logLine(resuming
+    ? `resuming orchestrator ${sessionId} — max ${CONFIG.maxUnits} unit(s)`
+    : `starting tick — new session ${sessionId}, max ${CONFIG.maxUnits} unit(s)`)
+  if (CONFIG.persistentSession && !resuming) writeOrchestrator(sessionId)
 
   const args = [
     '-p', prompt,
-    '--session-id', sessionId,
+    // `--session-id` NAMES a new session; `--resume` continues an existing one.
+    // Passing both is rejected, so this is either/or.
+    ...(resuming ? ['--resume', sessionId] : ['--session-id', sessionId]),
     '--dangerously-skip-permissions',
     '--model', CONFIG.model,
     '--fallback-model', CONFIG.fallbackModel,
@@ -974,6 +1065,20 @@ before stopping — it is the only thing that survives you.`
       + `${retries} retries, peak ctx ${Math.round(peakCtx / 1000)}k`)
     logLine(`  tokens ${t.measured ? `${t.output} out, cache hit ${Math.round(t.cache_hit * 100)}%` : 'not measured (no result event)'}`
       + `, ${t.subagents} subagent(s), ${usageWrites} usage reading(s)`)
+
+    // ── rotation ───────────────────────────────────────────────────────────
+    // Persistence must not be allowed to defeat the context discipline the rest
+    // of this file exists to enforce. Past the ceiling the conversation is
+    // retired: the next tick opens a fresh session with the full brief, which
+    // re-orients from the journal line this session just wrote.
+    //
+    // Retiring only AFTER a clean exit is deliberate. A session that died to the
+    // usage window has lost nothing and should be resumed, not thrown away.
+    if (CONFIG.persistentSession && peakCtx >= CONFIG.rotateCtxTokens) {
+      fs.rmSync(P.orchestrator, { force: true })
+      logLine(`  orchestrator retired at ${Math.round(peakCtx / 1000)}k context `
+        + `(ceiling ${Math.round(CONFIG.rotateCtxTokens / 1000)}k) — next tick starts a fresh one`)
+    }
 
     // Did this session actually ship anything? The git tree answers; the
     // agent's own summary does not. A session that only committed its journal
@@ -1498,6 +1603,85 @@ async function cmdSprint() {
   console.log(`sprint — ended after ${pass} pass(es), ${mins}m.`)
 }
 
+// ─────────────────────────────────────────────────────────────────── chat
+//
+// The command this whole persistent-session change exists for.
+//
+// Before it, steering the build meant opening a SECOND interactive Claude Code
+// session, which read the run log, worked out what had happened, and ran
+// `harness say` on your behalf. A translator between you and your own agent.
+//
+// It is unnecessary because a headless session is not a special kind of
+// session. `claude -p` writes an ordinary transcript to ~/.claude/projects, the
+// same place an interactive one does — so the orchestrator can simply be
+// RESUMED interactively. What you get is the real Claude Code TUI, with its
+// slash commands and its history, attached to the exact conversation the
+// scheduler has been driving. You talk to the orchestrator. There is no
+// middle man, because there is nothing left for one to do.
+//
+// The scheduler is held off for the duration. Two processes appending to one
+// transcript would interleave the conversation into nonsense, so cmdTick
+// refuses to start while the attach marker names a live PID, and this releases
+// the marker on every exit path including a signal.
+async function cmdChat(argv) {
+  ensureDirs()
+
+  const held = attachedPid()
+  if (held) {
+    console.error(`already attached in another terminal (pid ${held}).`)
+    console.error('One conversation, one keyboard — close that one first.')
+    process.exit(1)
+  }
+
+  const running = readInt(P.lock)
+  if (running) {
+    try {
+      process.kill(running, 0)
+      console.error(`a tick is running right now (pid ${running}).`)
+      console.error('Wait for it, or `harness say "..."` to queue a message into it,')
+      console.error('or `harness pause` then retry once it lands.')
+      process.exit(1)
+    } catch { /* stale lock, carry on */ }
+  }
+
+  let sid = CONFIG.persistentSession ? readOrchestrator() : null
+  const fresh = !sid
+  if (fresh) {
+    // Nothing has run yet, or the conversation was rotated. Opening the brief
+    // as a new session is the right move: it is the same thing the next tick
+    // would have done, and it means `harness chat` works on a cold install.
+    sid = randomUUID()
+    writeOrchestrator(sid)
+  }
+
+  fs.writeFileSync(P.attached, String(process.pid))
+  const release = () => { try { fs.rmSync(P.attached, { force: true }) } catch {} }
+  process.on('exit', release)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    process.on(sig, () => { release(); process.exit(0) })
+  }
+
+  console.log(fresh
+    ? `starting the orchestrator conversation (${sid.slice(0, 8)}) — the scheduler will resume THIS session`
+    : `attaching to the orchestrator (${sid.slice(0, 8)}) — the same session the scheduler drives`)
+  console.log('scheduler is held off while you are attached. Exit to hand it back.\n')
+
+  const args = fresh
+    ? ['--session-id', sid, fs.readFileSync(P.prompt, 'utf8')]
+    : ['--resume', sid]
+  // Same flags the tick uses, minus the headless ones: this is a real TUI.
+  args.push('--model', CONFIG.model, '--dangerously-skip-permissions', '--strict-mcp-config')
+  args.push(...argv)
+
+  // stdio inherit is the whole trick — the child owns the terminal and renders
+  // the genuine Claude Code interface. Nothing here proxies or reimplements it.
+  const child = spawn('claude', args, { cwd: REPO, env: childEnv(), stdio: 'inherit' })
+  const code = await new Promise(res => child.on('close', res))
+  release()
+  console.log(`\ndetached — scheduler resumes at the next tick (${CONFIG.intervalSec / 60}m).`)
+  process.exit(code ?? 0)
+}
+
 function cmdBudget(arg) {
   ensureDirs()
   const total = spentTotal()
@@ -1755,6 +1939,12 @@ function cmdStatus() {
   console.log(`scheduler   ${schedulerState()}`)
   console.log(`usage       5h ${u.fivePct}%  7d ${u.sevenPct}%  (floor ${CONFIG.usageFloorPct}%)`)
   console.log(`cooldown    ${cd.until > nowSec() ? `${new Date(cd.until * 1000).toLocaleTimeString()} (${cd.reason})` : 'none'}`)
+  if (CONFIG.persistentSession) {
+    const sid = readOrchestrator()
+    const who = attachedPid()
+    console.log(`orchestrator ${sid ? `${sid.slice(0, 8)} (harness chat to talk to it)` : 'none yet — first tick or `harness chat` opens one'}`
+      + (who ? `  ATTACHED pid ${who}, scheduler held off` : ''))
+  }
   const idle = readIdleStreak()
   if (idle > 0) {
     const wait = idleBackoffSec({ streak: idle, baseSec: CONFIG.intervalSec, capSec: CONFIG.idleBackoffCapSec })
@@ -1804,6 +1994,7 @@ switch (cmd) {
   case 'tick': await cmdTick(); break
   case 'hook': await cmdHook(); break
   case 'ui': await cmdUi(); break
+  case 'chat': case 'attach': await cmdChat(rest); break
   case 'say': say(rest.join(' ')); console.log('queued for delivery'); break
   case 'sprint': await cmdSprint(); break
   case 'budget': cmdBudget(rest[0]); break
@@ -1815,8 +2006,10 @@ switch (cmd) {
   case 'stop': cmdStop(); break
   case 'install': cmdInstall(); break
   default:
-    console.log(`usage: node scripts/harness/harness.mjs <command>
+    console.log(`usage: harness <command>
 
+  chat            talk to the orchestrator — the real Claude Code TUI, on the
+                  same session the scheduler drives
   tick            run one build session   (launchd calls this)
   hook            Claude Code hook target (settings.json calls this)
   ui              live dashboard on :${CONFIG.uiPort} + message channel
