@@ -175,10 +175,53 @@ would never fire. `bookkeepingPaths` names the paths that do not count as work.
 An `idle` cooldown is never bought through with paid credits. Buying through would purchase
 the privilege of rediscovering there is no work, sooner.
 
+## Runaway guardrail
+
+Every other gate here is **pre-flight** (usage floor, budget cap, cooldown — should a session
+start?) or **post-mortem** (what did that session turn out to be?). Between them a running
+session was unsupervised: it could spin on one tool call, or burn output at several times its
+normal rate, for a whole context window, and the first the harness knew was the bill.
+
+The breaker watches a live session and escalates one rung per beat:
+
+| | |
+|---|---|
+| `healthy` | nothing to say |
+| `steering` | a message asking what is going on — the agent may have a good reason |
+| `constrained` | an instruction to land: commit what is verified, journal, stop |
+| `stopped` | kill the process — **off unless `hardStop` is set** |
+
+It trips on a tool call repeated identically, an api-error storm, no distinct tool call for
+ten minutes, a per-session dollar cap, or sustained output velocity. It de-escalates a rung
+per healthy beat, so a blip does not stick.
+
+Three details that are easy to get wrong and are therefore tested:
+
+- **Velocity is the diff of two cumulative samples**, never one sample read as an increment.
+- **Compaction is exempt.** It burns a burst of output while touching nothing — the exact
+  shape of a false positive.
+- **Enforcement below `stopped` is a message**, delivered through the same inbox a human
+  `harness say` uses, so the agent can answer or disagree rather than being cut off.
+
+## Durable memory
+
+Sessions rotate at the context ceiling, so everything the retired session knew is lost —
+previously all that carried over was one journal line. `.harness-memory.md` is a bounded
+markdown file the agent reads at session start and appends to as it learns:
+
+```
+## Pinned     durable facts. Never evicted, never rewritten, never trimmed to fit.
+## Notes      newest-first working memory. Bounded by count and by bytes.
+```
+
+Eviction is **lossless** — overflow moves to `.harness-memory.archive.md`, which the agent
+can grep. Nothing is summarised, so nothing can be summarised wrongly. A memory file that
+does not have these headings is left byte-for-byte alone rather than restructured.
+
 ## Tests
 
 ```bash
-npm test          # 207 assertions
+npm test          # 254 assertions
 npm run test:stress
 ```
 
@@ -219,6 +262,24 @@ failure modes appearing, and fail loudly if one is swallowed into the wrong plac
   unattended. It should never be the thing that performs an outward-facing, irreversible
   action — sending, publishing, purchasing, submitting. Those want a human at the gate, and
   no scheduler is one.
+
+## Prior art and attribution
+
+The circuit-breaker policy in `src/breaker.mjs` and the memory shape in `src/memory.mjs` are
+ported from **[Munder Difflin](https://github.com/chaitanyagiri/munder-difflin)** by Chaitanya
+Giri (MIT) — a local multi-agent harness that solves the same problems for a floor of agents
+rather than one. Its `src/main/breaker.ts` and `src/main/memory.ts` are worth reading. The
+escalation ladder, the compaction exemption, the truncated tool key and the pinned/rolling
+memory regions are all its ideas; the wiring here is this project's.
+
+Two things were deliberately **not** taken:
+
+- **Stop-hook forced continuation.** Its design doc presents this as the autonomous loop; its
+  shipped code has it disabled, with the reason in a comment — it "could spend credits while a
+  user was answering a question". A lesson available for free.
+- **LLM-condensed memory and a semantic-recall CLI dependency.** Right at a floor of agents,
+  wrong at one, and wrong for a tool whose selling point is zero dependencies. Eviction here
+  is lossless and deterministic instead.
 
 ## Licence
 

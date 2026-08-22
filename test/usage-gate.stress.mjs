@@ -39,7 +39,11 @@ function sandbox() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'usage-gate-'))
   const hdir = path.join(root, 'harness')
   fs.mkdirSync(hdir, { recursive: true })
-  for (const f of ['harness.mjs', 'classify.mjs']) {
+  // Derived from harness.mjs's own imports — a hardcoded list drifts the moment
+  // a module is added, and the failure looks like a dead CLI, not a missing file.
+  const src = fs.readFileSync(path.join(SRC, 'harness.mjs'), 'utf8')
+  const local = [...src.matchAll(/from\s+'\.\/([\w.-]+)'/g)].map(m => m[1])
+  for (const f of ['harness.mjs', ...local]) {
     fs.copyFileSync(path.join(SRC, f), path.join(hdir, f))
   }
   const home = path.join(root, 'home')

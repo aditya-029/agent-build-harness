@@ -28,6 +28,21 @@
 
   "bookkeepingPaths": ["logs/journal.jsonl"],
 
+  "memoryPath": ".harness-memory.md",
+  "memoryKeepNotes": 20,
+  "memoryMaxBytes": 24000,
+
+  "breakerBeatSec": 20,
+  "breaker": {
+    "enabled": true,
+    "repeatLimit": 6,
+    "errorLimit": 5,
+    "noProgressMs": 600000,
+    "velocityTokensPerMin": 2500,
+    "sessionCapUsd": 8,
+    "hardStop": false
+  },
+
   "compactRules": [
     "Never delete or weaken a failing test to go green.",
     "src/schema.ts is the single source of truth for every literal."

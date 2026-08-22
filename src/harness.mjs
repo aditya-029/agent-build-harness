@@ -53,6 +53,8 @@ import {
   SUPERVISOR_PREFIX, isStaleSupervisorLine,
   classifyRun, idleBackoffSec, producedWork,
 } from './classify.mjs'
+import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from './breaker.mjs'
+import { trimMemory, memoryBrief, MEMORY_TEMPLATE } from './memory.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -234,6 +236,23 @@ const CONFIG = {
   // behind it rotates, and `harness chat` never has to know which one is live.
   rotateCtxTokens: num(pick('rotateCtxTokens', process.env.ROTATE_CTX, 120_000)),
 
+  // ── RUNAWAY GUARDRAIL ────────────────────────────────────────────────────
+  // Every other gate here is pre-flight or post-mortem. Between them a running
+  // session was unsupervised: it could spin on one tool call, or burn output at
+  // several times its normal rate, for a whole context window, and the first
+  // the harness knew of it was the bill. See breaker.mjs — the policy is ported
+  // from Munder Difflin (MIT), the wiring is ours.
+  breaker: { ...BREAKER_DEFAULTS, ...(PROJECT.breaker || {}) },
+  // How often the breaker evaluates a running session.
+  breakerBeatSec: num(pick('breakerBeatSec', process.env.BREAKER_BEAT, 20)),
+
+  // Durable memory, carried across session rotations. See memory.mjs — without
+  // it a rotation loses everything the retired session knew except one journal
+  // line. Repo-relative; the archive sits beside it.
+  memoryPath: pick('memoryPath', process.env.HARNESS_MEMORY, '.harness-memory.md'),
+  memoryKeepNotes: num(pick('memoryKeepNotes', process.env.MEMORY_KEEP, 20)),
+  memoryMaxBytes: num(pick('memoryMaxBytes', process.env.MEMORY_MAX_BYTES, 24_000)),
+
   // Rules re-injected verbatim after a context compaction, on top of the
   // generic ones below. These are the project's OWN non-negotiables — the
   // things that are both forbidden and invisible in a diff. Keep the list
@@ -296,6 +315,11 @@ const P = {
   // Held while a human is attached via `harness chat`. Two processes writing one
   // session transcript would corrupt it, so the tick refuses to run behind it.
   attached: path.join(STATE, 'attached'),
+  // Touched by the PreCompact hook so the RUNNING tick — a different process —
+  // can grant the breaker its compaction exemption. Compaction burns a burst of
+  // output while touching nothing, which is the exact shape of a velocity false
+  // positive, and it is the one Munder Difflin actually hit in production.
+  compacting: path.join(STATE, 'compacting'),
   // Session id of the tick currently in flight. The inbox is repo-global and
   // ANY Claude Code session in this tree runs the same PreToolUse hook, so
   // without this an interactive session sitting in the repo drains messages
@@ -323,6 +347,10 @@ const P = {
   // The build brief. Lives in the TARGET repo, not next to the harness — it is
   // the one input that is entirely the project's own.
   prompt: path.resolve(REPO, CONFIG.promptPath),
+  // Durable memory lives in the REPO, not in .harness/ — it is the project's
+  // knowledge, it is worth committing, and it must survive `rm -rf .harness`.
+  memory: path.resolve(REPO, CONFIG.memoryPath),
+  memoryArchive: path.resolve(REPO, CONFIG.memoryPath.replace(/\.md$/, '') + '.archive.md'),
   ui: path.join(HERE, 'ui.html'),
   plist: path.join(os.homedir(), 'Library/LaunchAgents', `${CONFIG.label}.plist`),
   claudeConfig: path.join(os.homedir(), '.claude.json'),
@@ -382,6 +410,31 @@ function attachedPid() {
   const pid = readInt(P.attached)
   if (!pid) return 0
   try { process.kill(pid, 0); return pid } catch { fs.rmSync(P.attached, { force: true }); return 0 }
+}
+
+// Seeded on first use so the agent has the shape to write into rather than
+// inventing one, which is how a "memory file" becomes an unbounded log.
+function readMemory() {
+  try { return fs.readFileSync(P.memory, 'utf8') } catch { return '' }
+}
+function ensureMemory() {
+  if (!exists(P.memory)) {
+    try { fs.writeFileSync(P.memory, MEMORY_TEMPLATE) } catch { /* read-only tree */ }
+  }
+}
+/** Hold memory to its bound, moving evictions to the archive. Lossless. */
+function boundMemory() {
+  const before = readMemory()
+  if (!before) return 0
+  const { text, archived } = trimMemory(before, {
+    keepNotes: CONFIG.memoryKeepNotes, maxBytes: CONFIG.memoryMaxBytes,
+  })
+  if (!archived.length) return 0
+  try {
+    fs.appendFileSync(P.memoryArchive, archived.join('\n\n') + '\n\n')
+    fs.writeFileSync(P.memory, text)
+  } catch { return 0 }
+  return archived.length
 }
 
 const readIdleStreak = () => readInt(P.idleStreak)
@@ -491,6 +544,8 @@ function observedUsage(now = nowSec()) {
  *   error           — something is wrong; spending money faster will not fix it
  *   probe_throttle  — deliberate rate limit on our own probing
  *   transient       — the connection dropped; wait a beat, do not buy anything
+ *   breaker         — WE killed it. Something was wrong with the session
+ *                     itself, and paying to restart it sooner buys a repeat
  *   idle            — there is NO WORK. Buying through would purchase the
  *                     privilege of rediscovering that sooner, which is exactly
  *                     the $8.38 the backoff exists to stop spending.
@@ -810,6 +865,18 @@ ${meterPreamble()}
 SESSION BUDGET: ${CONFIG.maxUnits} unit(s), and the context ceiling still applies.
 Stop cleanly and write the journal line when you reach either.` : `${fs.readFileSync(P.prompt, 'utf8')}
 
+${memoryBrief(readMemory())}
+
+DURABLE MEMORY: ${path.relative(REPO, P.memory)}. This session will eventually be
+retired and replaced by a fresh one — everything in your context now is lost at
+that point, and this file is the ONLY thing that carries over besides the journal.
+Append what a future session would be sorry not to know: a decision and why, a
+constraint that is not obvious from the code, an approach that was tried and
+failed. Put anything that must never be lost under "## Pinned"; everything else
+goes newest-first under "## Notes". Do not write status there — that is the
+journal's job. The harness keeps the file bounded, so append freely.
+
+
 ${meterPreamble()}
 
 SESSION BUDGET: two limits, and the context one is the real one.
@@ -854,6 +921,7 @@ before stopping — it is the only thing that survives you.`
     }
   }
 
+  ensureMemory()
   const dropped = dropStaleSupervisorLines()
   if (dropped) logLine(`dropped ${dropped} stale supervisor nudge(s) from a prior session`)
 
@@ -898,6 +966,7 @@ before stopping — it is the only thing that survives you.`
   const headBefore = gitHead()
   const child = spawn('claude', args, { cwd: REPO, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
   child.stderr.pipe(errSink)
+
 
   // Classify from structured events, never from prose. The old harness grepped
   // stdout for "usage limit" and so scored every productive session — which
@@ -952,6 +1021,43 @@ before stopping — it is the only thing that survives you.`
       logLine(`context ceiling ${k}k — handoff requested`)
     },
   })
+
+  // ── runaway guardrail ────────────────────────────────────────────────────
+  // Fed from the stream (tool calls, errors) and from the PreCompact marker the
+  // hook drops, then evaluated on a timer. Enforcement is deliberately gentle:
+  // `steer` and `constrain` are MESSAGES, delivered through the same inbox path
+  // a human `harness say` uses, so the agent can answer or disagree. Only a
+  // `stop` — off unless hardStop is set — touches the process.
+  const breaker = createBreaker(CONFIG.breaker)
+  fs.rmSync(P.compacting, { force: true })
+  let breakerLevel = 'healthy', killedByBreaker = false
+  const breakerTimer = setInterval(() => {
+    const t = Date.now()
+    // Cross-process compaction signal. The marker is consumed, so one
+    // compaction grants one exemption window.
+    if (exists(P.compacting)) {
+      fs.rmSync(P.compacting, { force: true })
+      breaker.recordCompactStart(t)
+    }
+    const d = breaker.beat({
+      outputTokens: tokenMeter.snapshot().output,
+      usd: result?.total_cost_usd ?? null,
+      now: t,
+    })
+    if (d.changed) {
+      breakerLevel = d.level
+      logLine(`  breaker ${d.level}${d.reason ? ` — ${d.reason}` : ' — recovered'}`)
+    }
+    if (d.action === 'steer' || d.action === 'constrain') {
+      // Supervisor-authored, so it is not delivered in Adi's voice.
+      say(breakerMessage(d.level, d.reason), { supervisor: true })
+    } else if (d.action === 'stop') {
+      killedByBreaker = true
+      logLine(`  breaker HALTING the session — ${d.reason}`)
+      try { child.kill('SIGTERM') } catch {}
+    }
+  }, CONFIG.breakerBeatSec * 1000)
+  breakerTimer.unref?.()
   child.stdout.on('data', chunk => {
     sink.write(chunk)
     buf += chunk.toString('utf8')
@@ -963,6 +1069,9 @@ before stopping — it is the only thing that survives you.`
       if (ev.type === 'result') result = ev
       else if (ev.type === 'system' && ev.subtype === 'api_retry') {
         retries++; if (ev.error === 'rate_limit') rateLimited++
+        // A rate limit is the harness's own gate working, not a fault. Only
+        // other errors count toward the storm arm.
+        if (ev.error !== 'rate_limit') breaker.recordError()
       }
       // The structured limit signal. Carries resetsAt as a unix timestamp, so
       // the resume time is exact and never parsed out of prose like
@@ -1018,6 +1127,12 @@ before stopping — it is the only thing that survives you.`
       }
       else if (ev.type === 'assistant') {
         ctxWatcher.feed(ev); peakCtx = ctxWatcher.peak()
+        // A NEW (name+input) is forward progress; the same one again is the
+        // loop signal. Subagent calls count too — a subagent spinning is a
+        // runaway just as surely as the main thread doing it.
+        for (const c of ev.message?.content || []) {
+          if (c?.type === 'tool_use') breaker.recordToolUse(c.name, c.input, Date.now())
+        }
       }
       // Not an else-branch: the meter needs the `result` event, which is
       // matched further up.
@@ -1026,6 +1141,8 @@ before stopping — it is the only thing that survives you.`
   })
 
   const code = await new Promise(res => child.on('close', res))
+  clearInterval(breakerTimer)
+  fs.rmSync(P.compacting, { force: true })
   sink.end(); errSink.end()
   try { fs.rmSync(P.currentSession, { force: true }) } catch {}
 
@@ -1041,6 +1158,7 @@ before stopping — it is the only thing that survives you.`
     peak_ctx_tokens: peakCtx,
     tokens: tokenMeter.snapshot(),
     used_paid_credits: overageSeen,
+    breaker: breakerLevel === 'healthy' ? null : { level: breakerLevel, halted: killedByBreaker },
     // Where the account stood when this run ended — the only usage reading that
     // is certainly current for this run, and the one `usage` reports between
     // runs rather than re-reading a cache of unknown age.
@@ -1066,6 +1184,9 @@ before stopping — it is the only thing that survives you.`
     logLine(`  tokens ${t.measured ? `${t.output} out, cache hit ${Math.round(t.cache_hit * 100)}%` : 'not measured (no result event)'}`
       + `, ${t.subagents} subagent(s), ${usageWrites} usage reading(s)`)
 
+    const evicted = boundMemory()
+    if (evicted) logLine(`  memory bounded — ${evicted} section(s) moved to ${path.basename(P.memoryArchive)}`)
+
     // ── rotation ───────────────────────────────────────────────────────────
     // Persistence must not be allowed to defeat the context discipline the rest
     // of this file exists to enforce. Past the ceiling the conversation is
@@ -1077,7 +1198,8 @@ before stopping — it is the only thing that survives you.`
     if (CONFIG.persistentSession && peakCtx >= CONFIG.rotateCtxTokens) {
       fs.rmSync(P.orchestrator, { force: true })
       logLine(`  orchestrator retired at ${Math.round(peakCtx / 1000)}k context `
-        + `(ceiling ${Math.round(CONFIG.rotateCtxTokens / 1000)}k) — next tick starts a fresh one`)
+        + `(ceiling ${Math.round(CONFIG.rotateCtxTokens / 1000)}k) — next tick starts a fresh one, `
+        + `carrying ${path.basename(P.memory)} and the journal`)
     }
 
     // Did this session actually ship anything? The git tree answers; the
@@ -1128,6 +1250,14 @@ before stopping — it is the only thing that survives you.`
     logLine(`tick hit the usage window ($${rec.cost_usd.toFixed(4)}, ${rec.turns} turns, `
       + `peak ctx ${Math.round(peakCtx / 1000)}k) — ${how}, resuming `
       + `${new Date(resume * 1000).toLocaleTimeString()}`)
+  } else if (killedByBreaker) {
+    // Not an API fault and not a usage limit — the harness killed this itself.
+    // It gets the error backoff because whatever caused it will still be there
+    // in fifteen minutes, but it is logged as its own thing so it can never be
+    // mistaken for a network problem when someone reads the log later.
+    writeCooldown(nowSec() + CONFIG.errorBackoffSec, 'breaker')
+    logLine(`tick HALTED by the breaker — retry in ${CONFIG.errorBackoffSec / 60}m. `
+      + `Read the run log before re-arming; the breaker does not fire on healthy sessions.`)
   } else if (outcome === 'transient') {
     // The stream dropped. Nothing is wrong with the account, and the work the
     // session had already committed is still committed — so retry soon rather
@@ -1197,6 +1327,7 @@ async function cmdHook() {
     // rule is a request, while injecting it into the live context afterwards is
     // the rule being present.
     try { fs.writeFileSync(path.join(P.events, `${sid}.repin`), String(nowSec())) } catch {}
+    try { fs.writeFileSync(P.compacting, String(nowSec())) } catch {}
   }
   // Not process.exit(0): when stdout is a pipe the write above may still be
   // queued, and exiting truncates it. Truncated JSON on a hook's stdout is

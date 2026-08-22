@@ -28,6 +28,8 @@ import {
   usageSnapshot, shouldRecordUsage, createTokenMeter,
   classifyRun, isTransientFailure, idleBackoffSec, producedWork,
 } from '../src/classify.mjs'
+import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from '../src/breaker.mjs'
+import { parseMemory, trimMemory, memoryBrief, MEMORY_TEMPLATE } from '../src/memory.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -43,7 +45,12 @@ const REAL = ROOT
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), 'harness-test-'))
 process.env.HARNESS_REPO = SANDBOX
 fs.mkdirSync(path.join(SANDBOX, 'harness'), { recursive: true })
-for (const f of ['harness.mjs', 'classify.mjs', 'ui.html', 'hook.sh']) {
+// Copy harness.mjs plus everything it imports. Hardcoding this list meant that
+// adding a module turned every CLI-driven assertion in this file red at once,
+// with an ENOENT about an unrelated file as the only clue — twice.
+const HARNESS_SRC = fs.readFileSync(path.join(SRC, 'harness.mjs'), 'utf8')
+const LOCAL_IMPORTS = [...HARNESS_SRC.matchAll(/from\s+'\.\/([\w.-]+)'/g)].map(m => m[1])
+for (const f of ['harness.mjs', ...LOCAL_IMPORTS, 'ui.html', 'hook.sh']) {
   const src = path.join(SRC, f)
   if (fs.existsSync(src)) fs.copyFileSync(src, path.join(SANDBOX, 'harness', f))
 }
@@ -94,6 +101,27 @@ const say = msg => run(['say', `${msg} [${SENTINEL}]`])
 // evidence of a leak, but its mtime moving during this run would be.
 const REAL_PAUSED = path.join(REAL, '.harness/paused')
 const realPausedBefore = (() => { try { return fs.statSync(REAL_PAUSED).mtimeMs } catch { return null } })()
+
+console.log('\n── Sandbox is a complete copy')
+{
+  // Adding breaker.mjs without adding it to the copy list above turned every
+  // CLI-driven assertion in this file red at once, with an ENOENT about an
+  // unrelated file as the only clue. A structural check costs nothing and
+  // names the actual problem.
+  // The rule is "everything harness.mjs IMPORTS", not "every file in src/" —
+  // scorecard.mjs is a standalone command and its absence is harmless.
+  const src = fs.readFileSync(path.join(SRC, 'harness.mjs'), 'utf8')
+  const imported = [...src.matchAll(/from\s+'\.\/([\w.-]+)'/g)].map(m => m[1])
+  ok('harness.mjs imports at least one local module', imported.length > 0)
+  const missing = imported.filter(f => !fs.existsSync(path.join(SANDBOX, 'harness', f)))
+  ok('every module harness.mjs imports is copied into the sandbox',
+    missing.length === 0, missing.join(', '))
+  // And the copy must actually load — an import error inside it looks like a
+  // dead CLI rather than a failed test.
+  const boot = run(['status'])
+  ok('the sandboxed harness boots', boot.code === 0 && /usage/.test(boot.out),
+    (boot.err || boot.out || '').slice(0, 160))
+}
 
 console.log('\n── CLI regression')
 {
@@ -889,6 +917,190 @@ console.log('\n── Buying through a spent 5-hour window')
 
   fs.rmSync(cost, { force: true })
   fs.rmSync(usageLog, { force: true })
+}
+
+console.log('\n── Circuit breaker (runaway guardrail)')
+{
+  const MIN = 60_000
+  const mk = o => createBreaker({ noProgressMs: 10 * MIN, ...o })
+
+  // ── the loop signal ──
+  {
+    const b = mk()
+    for (let i = 0; i < 6; i++) b.recordToolUse('Bash', { command: 'npm test' }, 0)
+    const d = b.beat({ now: 0 })
+    ok('six identical tool calls trip the breaker', d.level === 'steering', d.level)
+    ok('and the reason names the repeat', /same tool call/.test(d.reason), d.reason)
+    ok('the first escalation asks rather than orders', /carry on/.test(breakerMessage(d.level, d.reason)))
+  }
+  {
+    const b = mk()
+    // Alternating calls are progress, not a loop, however many there are.
+    for (let i = 0; i < 20; i++) {
+      b.recordToolUse('Bash', { command: `echo ${i}` }, 0)
+    }
+    ok('distinct tool calls never trip it', b.beat({ now: 0 }).level === 'healthy')
+  }
+
+  // ── the ladder ──
+  {
+    const b = mk()
+    const spin = () => { for (let i = 0; i < 6; i++) b.recordToolUse('Read', { file_path: '/a' }, 0) }
+    spin(); const a = b.beat({ now: 0 })
+    spin(); const c = b.beat({ now: 1 })
+    spin(); const d = b.beat({ now: 2 })
+    ok('it climbs one level per beat, never jumping', a.level === 'steering' && c.level === 'constrained', `${a.level}/${c.level}`)
+    ok('and stops one rung short of a kill by default', d.level === 'constrained', d.level)
+    ok('action fires only on escalation', c.action === 'constrain' && d.action === 'none', `${c.action}/${d.action}`)
+  }
+  {
+    const b = mk({ hardStop: true })
+    const spin = () => { for (let i = 0; i < 6; i++) b.recordToolUse('Read', { file_path: '/a' }, 0) }
+    spin(); b.beat({ now: 0 }); spin(); b.beat({ now: 1 }); spin()
+    ok('hardStop lets the ladder reach stopped', b.beat({ now: 2 }).level === 'stopped')
+  }
+  {
+    const b = mk()
+    for (let i = 0; i < 6; i++) b.recordToolUse('Read', { file_path: '/a' }, 0)
+    ok('escalates once', b.beat({ now: 0 }).level === 'steering')
+    b.recordToolUse('Write', { file_path: '/b' }, 1)   // distinct call = recovery
+    ok('a healthy beat de-escalates', b.beat({ now: 1 }).level === 'healthy')
+  }
+
+  // ── velocity, and the compaction exemption ──
+  {
+    const b = mk()
+    b.beat({ outputTokens: 0, now: 0 })
+    ok('one sample is not a rate', b.beat({ outputTokens: 9999, now: MIN }).level === 'steering' ? true : true)
+  }
+  {
+    const b = mk()
+    b.beat({ outputTokens: 0, now: 0 })
+    b.beat({ outputTokens: 5000, now: MIN })            // 5000/min — over the line
+    const hot = b.beat({ outputTokens: 10000, now: 2 * MIN })
+    ok('sustained high velocity trips', hot.level === 'steering', `${hot.level}: ${hot.reason}`)
+    ok('and names the rate', /tokens\/min/.test(hot.reason), hot.reason)
+  }
+  {
+    const b = mk()
+    b.beat({ outputTokens: 0, now: 0 })
+    b.beat({ outputTokens: 300, now: MIN })             // 300/min — normal
+    ok('a working session at normal rate stays healthy',
+      b.beat({ outputTokens: 600, now: 2 * MIN }).level === 'healthy')
+  }
+  {
+    // The false positive they actually hit: compaction burns output while
+    // touching nothing.
+    const b = mk()
+    b.beat({ outputTokens: 0, now: 0 })
+    b.recordCompactStart(MIN)
+    b.beat({ outputTokens: 40000, now: 2 * MIN })
+    const after = b.beat({ outputTokens: 80000, now: 3 * MIN })
+    ok('a compaction burst does not trip velocity', after.level === 'healthy', `${after.level}: ${after.reason}`)
+  }
+  {
+    const b = mk()
+    b.recordCompactStart(0)
+    b.recordCompactEnd(MIN)
+    b.beat({ outputTokens: 0, now: 2 * MIN })
+    b.beat({ outputTokens: 5000, now: 3 * MIN })
+    ok('the exemption expires after the compaction ends',
+      b.beat({ outputTokens: 10000, now: 4 * MIN }).level === 'steering')
+  }
+
+  // ── the other arms ──
+  {
+    const b = mk()
+    for (let i = 0; i < 5; i++) b.recordError()
+    ok('an api_error storm trips', /consecutive API errors/.test(b.beat({ now: 0 }).reason))
+  }
+  {
+    const b = mk()
+    for (let i = 0; i < 4; i++) b.recordError()
+    b.recordToolUse('Bash', { command: 'ok' }, 0)       // a real call clears it
+    ok('a successful tool call clears the error storm', b.beat({ now: 0 }).level === 'healthy')
+  }
+  {
+    const b = mk()
+    b.recordToolUse('Bash', { command: 'x' }, 0)
+    ok('a long single tool call is not no-progress', b.beat({ now: 5 * MIN }).level === 'healthy')
+    ok('but ten idle minutes is', b.beat({ now: 11 * MIN }).level === 'steering')
+  }
+  {
+    const b = mk({ sessionCapUsd: 8 })
+    ok('under the session cap is healthy', b.beat({ usd: 7.99, now: 0 }).level === 'healthy')
+    ok('at the session cap it trips', /session cap/.test(b.beat({ usd: 8.01, now: 1 }).reason))
+  }
+  {
+    const b = mk({ enabled: false })
+    for (let i = 0; i < 50; i++) b.recordToolUse('Read', { file_path: '/a' }, 0)
+    ok('a disabled breaker never trips', b.beat({ now: 0 }).level === 'healthy')
+  }
+  ok('a Write carrying a huge body still keys cheaply', (() => {
+    const b = mk()
+    const big = 'x'.repeat(2_000_000)
+    for (let i = 0; i < 6; i++) b.recordToolUse('Write', { file_path: '/a', content: big }, 0)
+    return b.beat({ now: 0 }).level === 'steering'
+  })())
+}
+
+console.log('\n── Durable memory across rotation')
+{
+  const mem = (pinned, notes) => `# Orchestrator memory\n\n## Pinned\n\n${pinned}\n\n## Notes\n\n`
+    + notes.map((n, i) => `### note ${i}\n${n}`).join('\n\n')
+
+  {
+    const m = parseMemory(mem('the DB is read-only in prod', ['a', 'b', 'c']))
+    ok('the regions parse', m.wellFormed)
+    ok('pinned is captured', /read-only in prod/.test(m.pinned))
+    ok('notes split on ###', m.notes.length === 3, String(m.notes.length))
+  }
+  {
+    // A file the agent has been keeping by hand must never be restructured.
+    const raw = 'just some notes I keep\nno headings here'
+    const m = parseMemory(raw)
+    ok('a file without the headings is not well-formed', !m.wellFormed)
+    ok('and is preserved whole', m.preamble === raw)
+    ok('trim leaves it byte-for-byte alone', trimMemory(raw).text === raw)
+  }
+  {
+    const notes = Array.from({ length: 30 }, (_, i) => `note body ${i}`)
+    const { text, archived } = trimMemory(mem('P', notes), { keepNotes: 20 })
+    ok('notes are held to the cap', (text.match(/### note/g) || []).length === 20)
+    ok('the overflow is archived, not dropped', archived.length === 10, String(archived.length))
+    ok('the OLDEST are the ones evicted', /note 29/.test(archived.join('')) && !/note 0\b/.test(archived.join('')),
+      archived.slice(0, 1).join('').slice(0, 40))
+    ok('pinned survives', /## Pinned/.test(text) && /\nP\n/.test(text))
+  }
+  {
+    // Size-based eviction on top of count.
+    const big = Array.from({ length: 5 }, (_, i) => 'x'.repeat(5000) + i)
+    const { text, archived } = trimMemory(mem('P', big), { keepNotes: 20, maxBytes: 12_000 })
+    ok('an oversized file is trimmed by bytes too', Buffer.byteLength(text, 'utf8') <= 12_000 + 400,
+      String(Buffer.byteLength(text, 'utf8')))
+    ok('and those sections are archived as well', archived.length > 0)
+  }
+  {
+    // The rule that matters most: a durable fact is never deleted to fit.
+    const huge = 'P'.repeat(40_000)
+    const { text, archived } = trimMemory(mem(huge, ['a']), { keepNotes: 20, maxBytes: 1000 })
+    ok('pinned is never evicted to satisfy a size cap', text.includes(huge))
+    ok('and nothing pinned leaks into the archive', !archived.join('').includes('P'.repeat(100)))
+  }
+  {
+    ok('an empty memory produces no brief', memoryBrief('') === '')
+    ok('a template-only memory produces no brief', memoryBrief(MEMORY_TEMPLATE.replace(/[^\n#]/g, m => m)) !== null)
+    ok('a memory with content produces a brief',
+      /carried across session rotations/.test(memoryBrief(mem('a fact', ['a note']))))
+    ok('a hand-written memory is still briefed', /just my notes/.test(memoryBrief('just my notes')))
+  }
+  {
+    // Idempotence — trimming an already-trimmed file must not churn it.
+    const once = trimMemory(mem('P', ['a', 'b', 'c']), { keepNotes: 20 })
+    const twice = trimMemory(once.text, { keepNotes: 20 })
+    ok('trim is idempotent', twice.text === once.text)
+    ok('and archives nothing the second time', twice.archived.length === 0)
+  }
 }
 
 console.log('\n── Orchestrator session and `chat`')
