@@ -55,6 +55,9 @@ import {
 } from './classify.mjs'
 import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from './breaker.mjs'
 import { trimMemory, memoryBrief, MEMORY_TEMPLATE } from './memory.mjs'
+import { chatArgs, remoteNotice } from './chat.mjs'
+import { validateBrief, BRIEF_TEMPLATE, briefPreamble } from './brief.mjs'
+import { createVerifier, verifierMessage, VERIFY_CHECKLIST } from './verify.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -228,6 +231,24 @@ const CONFIG = {
   //
   // Set false to restore the old spawn-per-tick behaviour.
   persistentSession: PROJECT.persistentSession !== false && process.env.PERSISTENT_SESSION !== '0',
+
+  // ── REACHING THE ORCHESTRATOR FROM SOMEWHERE ELSE ────────────────────────
+  // `harness chat` spawns a real interactive Claude Code TUI, so it can carry
+  // Claude Code's own Remote Control flag. That is the whole answer to "I am
+  // not at my Mac": the orchestrator session registers itself, and the Claude
+  // app on a phone reaches THIS session — the same one the scheduler drives.
+  //
+  // No bespoke UI, no auth layer, nothing listening on a non-loopback port.
+  // The alternative designs all required inventing a transport; this one is a
+  // flag on a process that already exists.
+  //
+  // Off by default: registering a session with `--dangerously-skip-permissions`
+  // for remote reach is a real decision, and it should be made deliberately in
+  // .harness.json rather than inherited by anyone who clones this.
+  remoteControl: PROJECT.remoteControl === true || process.env.REMOTE_CONTROL === '1',
+  // The name the session registers under. Functional, not decorative: it is
+  // how you tell one project's orchestrator from another's in the session list.
+  remoteName: pick('remoteName', process.env.REMOTE_NAME, null),
 
   // Context at which the orchestrator session is retired and a fresh one
   // seeded from the journal. Persistence must not be allowed to defeat the
@@ -863,7 +884,10 @@ the "next" value you last wrote and continue.
 ${meterPreamble()}
 
 SESSION BUDGET: ${CONFIG.maxUnits} unit(s), and the context ceiling still applies.
-Stop cleanly and write the journal line when you reach either.` : `${fs.readFileSync(P.prompt, 'utf8')}
+Stop cleanly and write the journal line when you reach either.
+
+Claims still cost a command. Do not report a check you ran earlier in this
+session as if you just ran it — re-run it or say when it last passed.` : `${fs.readFileSync(P.prompt, 'utf8')}
 
 ${memoryBrief(readMemory())}
 
@@ -893,7 +917,16 @@ SESSION BUDGET: two limits, and the context one is the real one.
 
 Whichever you reach first, stop cleanly. The supervisor restarts shortly, so
 stopping costs nothing. Always append the ${path.relative(REPO, P.journal)} line
-before stopping — it is the only thing that survives you.`
+before stopping — it is the only thing that survives you.
+
+${VERIFY_CHECKLIST}`
+
+  // Before anything is spent: does this brief name an artifact? Only fresh
+  // conversations are checked — see briefGate().
+  if (!briefGate({ fresh: !resuming })) {
+    logLine('BRIEF INCOMPLETE — not starting. No Deliverable means no way to know when to stop.')
+    return
+  }
 
   // Checked after the lock and the cooldown, before spending anything. A
   // balance does not refill the way the usage window does, so this stop is
@@ -1029,6 +1062,11 @@ before stopping — it is the only thing that survives you.`
   // a human `harness say` uses, so the agent can answer or disagree. Only a
   // `stop` — off unless hardStop is set — touches the process.
   const breaker = createBreaker(CONFIG.breaker)
+  // Watches what the session CLAIMS against what it actually ran. Advisory:
+  // it writes a warning into the run record and the journal, it does not stop
+  // anything. A false positive that kills a good session costs more than the
+  // claim it caught.
+  const verifier = createVerifier()
   fs.rmSync(P.compacting, { force: true })
   let breakerLevel = 'healthy', killedByBreaker = false
   const breakerTimer = setInterval(() => {
@@ -1131,7 +1169,12 @@ before stopping — it is the only thing that survives you.`
         // loop signal. Subagent calls count too — a subagent spinning is a
         // runaway just as surely as the main thread doing it.
         for (const c of ev.message?.content || []) {
-          if (c?.type === 'tool_use') breaker.recordToolUse(c.name, c.input, Date.now())
+          if (c?.type === 'tool_use') {
+            breaker.recordToolUse(c.name, c.input, Date.now())
+            verifier.tool(c.name, c.input)
+          }
+          // Claims are made in prose, so the verifier has to read the prose.
+          else if (c?.type === 'text') verifier.text(c.text || '')
         }
       }
       // Not an else-branch: the meter needs the `result` event, which is
@@ -1159,6 +1202,15 @@ before stopping — it is the only thing that survives you.`
     tokens: tokenMeter.snapshot(),
     used_paid_credits: overageSeen,
     breaker: breakerLevel === 'healthy' ? null : { level: breakerLevel, halted: killedByBreaker },
+    // What the run claimed, and whether it ran anything that could support it.
+    // Recorded on every run so the replay suite can measure how often this
+    // fires before anyone is tempted to make it a hard gate.
+    verify: (() => {
+      const v = verifier.verdict()
+      return v.claims.length === 0 && v.evidence.length === 0
+        ? null
+        : { claims: v.claims.length, evidence: v.evidence.length, stated_limits: v.statedLimits, unearned: v.unearned }
+    })(),
     // Where the account stood when this run ended — the only usage reading that
     // is certainly current for this run, and the one `usage` reports between
     // runs rather than re-reading a cache of unknown age.
@@ -1167,6 +1219,11 @@ before stopping — it is the only thing that survives you.`
     log: path.relative(REPO, runLogPath),
   }
   fs.appendFileSync(P.cost, JSON.stringify(rec) + '\n')
+
+  // Say it out loud too. A warning buried in a JSONL line is a warning nobody
+  // reads; this is the one thing about a finished run worth interrupting for.
+  const verifyMsg = verifierMessage(verifier.verdict())
+  if (verifyMsg) console.warn(`\n  ${verifyMsg}`)
 
   // A run killed by the usage window is NOT an error and must not get the
   // generic backoff. See classify.mjs for why `subtype` and a bare
@@ -1785,6 +1842,8 @@ async function cmdChat(argv) {
     writeOrchestrator(sid)
   }
 
+  if (!briefGate({ fresh })) process.exit(1)
+
   fs.writeFileSync(P.attached, String(process.pid))
   const release = () => { try { fs.rmSync(P.attached, { force: true }) } catch {} }
   process.on('exit', release)
@@ -1795,14 +1854,26 @@ async function cmdChat(argv) {
   console.log(fresh
     ? `starting the orchestrator conversation (${sid.slice(0, 8)}) — the scheduler will resume THIS session`
     : `attaching to the orchestrator (${sid.slice(0, 8)}) — the same session the scheduler drives`)
-  console.log('scheduler is held off while you are attached. Exit to hand it back.\n')
+  console.log('scheduler is held off while you are attached. Exit to hand it back.')
+  const notice = remoteNotice({
+    remoteControl: CONFIG.remoteControl,
+    remoteName: CONFIG.remoteName,
+    project: CONFIG.project,
+    extra: argv,
+  })
+  if (notice) console.log(notice)
+  console.log('')
 
-  const args = fresh
-    ? ['--session-id', sid, fs.readFileSync(P.prompt, 'utf8')]
-    : ['--resume', sid]
-  // Same flags the tick uses, minus the headless ones: this is a real TUI.
-  args.push('--model', CONFIG.model, '--dangerously-skip-permissions', '--strict-mcp-config')
-  args.push(...argv)
+  const args = chatArgs({
+    sessionId: sid,
+    fresh,
+    prompt: fresh ? fs.readFileSync(P.prompt, 'utf8') : undefined,
+    model: CONFIG.model,
+    remoteControl: CONFIG.remoteControl,
+    remoteName: CONFIG.remoteName,
+    project: CONFIG.project,
+    extra: argv,
+  })
 
   // stdio inherit is the whole trick — the child owns the terminal and renders
   // the genuine Claude Code interface. Nothing here proxies or reimplements it.
@@ -1811,6 +1882,68 @@ async function cmdChat(argv) {
   release()
   console.log(`\ndetached — scheduler resumes at the next tick (${CONFIG.intervalSec / 60}m).`)
   process.exit(code ?? 0)
+}
+
+function cmdBrief(argv) {
+  ensureDirs()
+  const rel = path.relative(REPO, P.prompt)
+
+  if (argv[0] === 'init') {
+    if (fs.existsSync(P.prompt) && !argv.includes('--force')) {
+      console.error(`${rel} already exists — pass --force to overwrite it.`)
+      process.exit(1)
+    }
+    fs.writeFileSync(P.prompt, BRIEF_TEMPLATE)
+    console.log(`wrote ${rel} — fill in Goal and Deliverable, then \`harness brief\` to check it.`)
+    return
+  }
+
+  if (!fs.existsSync(P.prompt)) {
+    console.error(`no brief at ${rel}. Run \`harness brief init\` to start one.`)
+    process.exit(1)
+  }
+
+  const text = fs.readFileSync(P.prompt, 'utf8')
+  const v = validateBrief(text)
+  if (v.ok && v.problems.length === 0) {
+    console.log(`${rel} — complete.\n`)
+    console.log(briefPreamble(text))
+    return
+  }
+
+  console.log(`${rel}:\n`)
+  for (const problem of v.problems) console.log(`  ${v.ok ? '·' : '✗'} ${problem}`)
+  console.log('')
+  console.log(v.ok
+    ? 'Usable, but say "none" where you meant none.'
+    : 'A session opened on this brief will build something plausible and wrong.')
+  process.exit(v.ok ? 0 : 1)
+}
+
+// Refuse to OPEN a session on a brief with no artifact in it. This is the one
+// gate that runs before any tokens are spent, and it is worth being strict
+// about: an unattended agent with no definition of done does not stall, it
+// confidently builds the wrong thing for hours and reports success.
+//
+// Only fresh sessions are gated. A resumed conversation already has its brief,
+// and re-checking the file would let an edit mid-build halt a healthy run.
+function briefGate({ fresh, quiet = false }) {
+  if (!fresh) return true
+  if (!fs.existsSync(P.prompt)) return true   // nothing to check; other paths handle this
+  const v = validateBrief(fs.readFileSync(P.prompt, 'utf8'))
+  if (v.ok) return true
+  if (v.unstructured) {
+    // A free-prose brief is the pre-existing convention in this repo and
+    // predates the four-part rule, so it warns rather than blocks. Blocking it
+    // would break every existing install on upgrade.
+    if (!quiet) console.warn('  brief has no Goal/Deliverable sections — `harness brief init` writes the shape.')
+    return true
+  }
+  const rel = path.relative(REPO, P.prompt)
+  console.error(`refusing to start: ${rel} is incomplete.`)
+  for (const problem of v.problems) console.error(`  ✗ ${problem}`)
+  console.error('\nFix it, or run `harness brief` to see the whole picture.')
+  return false
 }
 
 function cmdBudget(arg) {
@@ -2128,6 +2261,7 @@ switch (cmd) {
   case 'chat': case 'attach': await cmdChat(rest); break
   case 'say': say(rest.join(' ')); console.log('queued for delivery'); break
   case 'sprint': await cmdSprint(); break
+  case 'brief': cmdBrief(rest); break
   case 'budget': cmdBudget(rest[0]); break
   case 'status': cmdStatus(); break
   case 'usage': cmdUsage(process.argv.slice(3)); break
@@ -2145,6 +2279,7 @@ switch (cmd) {
   hook            Claude Code hook target (settings.json calls this)
   ui              live dashboard on :${CONFIG.uiPort} + message channel
   say <message>   send a message to the running agent
+  brief [init]    check the brief has a Goal and a Deliverable (init writes one)
   status          one-screen summary
   usage           live cost meter — window, credits, tokens, cache (--json)
   pause | resume  skip ticks without unloading launchd

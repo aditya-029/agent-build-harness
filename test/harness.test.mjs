@@ -30,6 +30,9 @@ import {
 } from '../src/classify.mjs'
 import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from '../src/breaker.mjs'
 import { parseMemory, trimMemory, memoryBrief, MEMORY_TEMPLATE } from '../src/memory.mjs'
+import { chatArgs, hasFlag, remoteNotice } from '../src/chat.mjs'
+import { parseBrief, validateBrief, briefPreamble, BRIEF_TEMPLATE } from '../src/brief.mjs'
+import { createVerifier, verifierMessage, findClaims, isEvidence, VERIFY_CHECKLIST } from '../src/verify.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -1156,6 +1159,214 @@ console.log('\n── Orchestrator session and `chat`')
 
   live.kill()
   clean()
+}
+
+console.log('\n── Chat argv and Remote Control')
+{
+  const base = { sessionId: 'sid-1', model: 'sonnet', project: 'demo' }
+
+  const fresh = chatArgs({ ...base, fresh: true, prompt: 'BRIEF' })
+  ok('a fresh chat NAMES the session with --session-id',
+    fresh[0] === '--session-id' && fresh[1] === 'sid-1' && fresh[2] === 'BRIEF',
+    fresh.slice(0, 3).join(' '))
+
+  const resumed = chatArgs({ ...base, fresh: false })
+  ok('an existing conversation is continued with --resume',
+    resumed[0] === '--resume' && resumed[1] === 'sid-1' && !resumed.includes('--session-id'),
+    resumed.slice(0, 2).join(' '))
+
+  ok('a fresh chat without a brief is refused rather than opened empty',
+    (() => { try { chatArgs({ ...base, fresh: true }); return false } catch { return true } })())
+
+  ok('a chat with no session id is refused',
+    (() => { try { chatArgs({ ...base, sessionId: '', fresh: false }); return false } catch { return true } })())
+
+  ok('the TUI flags are present on both shapes',
+    ['--model', '--dangerously-skip-permissions', '--strict-mcp-config'].every(f =>
+      fresh.includes(f) && resumed.includes(f)))
+
+  // Remote control is OFF unless asked for. A session running with
+  // --dangerously-skip-permissions must not become remotely reachable by default.
+  ok('remote control is off by default',
+    !resumed.includes('--remote-control'))
+
+  const remote = chatArgs({ ...base, fresh: false, remoteControl: true })
+  ok('remote control registers under the project name when no name is set',
+    remote[remote.indexOf('--remote-control') + 1] === 'demo')
+  ok('remote control also sets --name so the session list is legible',
+    remote[remote.indexOf('--name') + 1] === 'demo')
+
+  const named = chatArgs({ ...base, fresh: false, remoteControl: true, remoteName: 'JARVIS' })
+  ok('an explicit remoteName wins over the project name',
+    named[named.indexOf('--remote-control') + 1] === 'JARVIS' &&
+    named[named.indexOf('--name') + 1] === 'JARVIS')
+
+  // The operator's own flag must not be duplicated — two --remote-control
+  // flags is an argv the CLI would reject, turning a convenience into a crash.
+  const override = chatArgs({
+    ...base, fresh: false, remoteControl: true, remoteName: 'JARVIS',
+    extra: ['--remote-control', 'MINE'],
+  })
+  ok('an operator --remote-control is not duplicated by config',
+    override.filter(a => a === '--remote-control').length === 1)
+  ok('the operator flag is the one that survives',
+    override[override.indexOf('--remote-control') + 1] === 'MINE')
+
+  const ownName = chatArgs({ ...base, fresh: false, remoteControl: true, extra: ['--name', 'MINE'] })
+  ok('an operator --name is not duplicated either',
+    ownName.filter(a => a === '--name').length === 1)
+
+  ok('operator flags come last so they override config',
+    (() => {
+      const a = chatArgs({ ...base, fresh: false, extra: ['--effort', 'high'] })
+      return a[a.length - 2] === '--effort' && a[a.length - 1] === 'high'
+    })())
+
+  ok('hasFlag matches the --flag=value form too',
+    hasFlag(['--name=MINE'], '--name') && hasFlag(['--name', 'x'], '--name') &&
+    !hasFlag(['--names'], '--name'))
+
+  ok('the attach notice names the session when remote control is on',
+    remoteNotice({ remoteControl: true, remoteName: 'JARVIS', project: 'demo' })?.includes('JARVIS'))
+  ok('there is no attach notice when remote control is off',
+    remoteNotice({ remoteControl: false, project: 'demo' }) === null)
+  ok('there is no attach notice when the operator passed the flag themselves',
+    remoteNotice({ remoteControl: true, project: 'demo', extra: ['--remote-control', 'MINE'] }) === null)
+}
+
+console.log('\n── The brief: four parts, one of them load-bearing')
+{
+  const full = `# Brief
+
+## Goal
+The login endpoint stops 500ing on emails containing a plus sign.
+
+## Constraints
+Fix in the auth service only. Do not touch the session store.
+
+## Budget
+One worker, small. Overnight, not a sprint.
+
+## Deliverable
+A PR against main with a regression test.
+`
+  const v = validateBrief(full)
+  ok('a complete brief passes', v.ok && v.problems.length === 0, v.problems.join('; '))
+
+  const { sections } = parseBrief(full)
+  ok('all four sections are parsed',
+    ['goal', 'constraints', 'budget', 'deliverable'].every(k => sections[k]?.length > 0))
+  ok('section bodies do not swallow the next heading',
+    !sections.goal.includes('Constraints'))
+
+  // The gate that matters.
+  const noDeliverable = full.replace(/## Deliverable[\s\S]*$/, '')
+  const nd = validateBrief(noDeliverable)
+  ok('a brief with no Deliverable is refused', !nd.ok && nd.missing.includes('deliverable'))
+  ok('the refusal says what a deliverable IS',
+    nd.problems.some(p => /artifact|PR|green|file/i.test(p)), nd.problems.join('; '))
+
+  const noGoal = full.replace(/## Goal[\s\S]*?(?=## Constraints)/, '')
+  ok('a brief with no Goal is refused', !validateBrief(noGoal).ok)
+
+  // A one-word deliverable is the exact failure this gate exists to catch.
+  const thin = full.replace('A PR against main with a regression test.', 'done')
+  const tv = validateBrief(thin)
+  ok('a one-word Deliverable is refused, not accepted', !tv.ok && tv.thin.includes('deliverable'))
+
+  // Missing Constraints/Budget is a nudge, never a block: "none" is a real
+  // answer and the harness already carries its own dollar cap.
+  const noConstraints = full.replace(/## Constraints[\s\S]*?(?=## Budget)/, '')
+  const nc = validateBrief(noConstraints)
+  ok('missing Constraints warns but does not block', nc.ok && nc.problems.length > 0)
+
+  // Free prose must not hard-fail — every install that predates this rule has
+  // exactly this shape, and breaking them on upgrade is worse than the gap.
+  const prose = validateBrief('Just build the thing, you know what I mean.')
+  ok('an unstructured brief is flagged as unstructured, not as missing sections',
+    !prose.ok && prose.unstructured === true)
+
+  ok('headings are matched case-insensitively and by alias',
+    validateBrief('# objective\nShip it properly.\n# definition of done\nA merged PR.').ok)
+  ok('a bare `Goal:` line counts as a heading',
+    Object.keys(parseBrief('Goal:\nShip it.\n').sections).includes('goal'))
+  ok('the first of two Goal headings wins',
+    parseBrief('## Goal\nfirst\n## Goal\nsecond\n').sections.goal === 'first')
+  ok('unrecognised sections are kept, not dropped',
+    parseBrief('## Context\nsome background\n').extra.Context === 'some background')
+
+  ok('the shipped template validates as complete once filled',
+    validateBrief(BRIEF_TEMPLATE.replace(/<[^>]*>/gs, 'a real answer with several words')).ok)
+
+  // Regression. `harness brief init` followed by `harness brief` reported
+  // "complete" on a brief whose Goal and Deliverable were still the angle-
+  // bracket placeholders: they are long enough to clear the word-count check.
+  // The gate was waving through exactly the brief it exists to stop. Caught by
+  // running the CLI, not by unit-testing the parser — the earlier test stripped
+  // the placeholders first and so could never have seen it.
+  const untouched = validateBrief(BRIEF_TEMPLATE)
+  ok('the UNFILLED template is refused', !untouched.ok, JSON.stringify(untouched.problems))
+  ok('the refusal points at the placeholders',
+    untouched.unfilled.includes('goal') && untouched.unfilled.includes('deliverable'))
+  ok('a half-filled section still counts as unfilled',
+    !validateBrief(BRIEF_TEMPLATE.replace('## Deliverable\n<The artifact', '## Deliverable\nA PR.\n<The artifact')).ok)
+  ok('a real answer that merely MENTIONS <angle brackets> is not treated as a placeholder',
+    validateBrief('## Goal\nRename <T> to <Item> across the generics in the parser.\n'
+      + '## Deliverable\nA merged PR renaming every generic parameter, with the suite green.\n').ok)
+
+  ok('the preamble tells the agent what to do with adjacent discoveries',
+    /record them as tasks. Do not fix them/i.test(briefPreamble(full)))
+  ok('the preamble carries all four parts', (() => {
+    const pre = briefPreamble(full)
+    return ['Goal:', 'Constraints:', 'Budget:', 'Deliverable:'].every(k => pre.includes(k))
+  })())
+}
+
+console.log('\n── Self-verification: a claim costs a command')
+{
+  ok('a success claim is recognised', findClaims('All tests pass now.').length > 0)
+  ok('a checkmark counts as a claim', findClaims('✅ done').length > 0)
+  ok('ordinary narration is not a claim', findClaims('I am going to look at the auth service.').length === 0)
+  ok('a stated FAILURE is not a success claim', findClaims('Two tests fail.').length === 0)
+
+  ok('npm test is evidence', isEvidence('Bash', { command: 'npm test' }))
+  ok('pytest is evidence', isEvidence('Bash', { command: 'pytest -q tests/' }))
+  ok('git diff --stat is evidence', isEvidence('Bash', { command: 'git diff --stat' }))
+  ok('cat is NOT evidence', !isEvidence('Bash', { command: 'cat package.json' }))
+  ok('Read is NOT evidence', !isEvidence('Read', { file_path: '/tmp/x' }))
+
+  // The case the whole module exists for.
+  const bad = createVerifier()
+  bad.tool('Read', { file_path: 'src/a.mjs' })
+  bad.tool('Edit', { file_path: 'src/a.mjs' })
+  bad.text('Fixed it — the build is green and all tests pass.')
+  const bv = bad.verdict()
+  ok('a green claimed with nothing run is flagged unearned', bv.unearned === true && bv.ok === false)
+  ok('the warning names the claim it caught',
+    /UNVERIFIED CLAIM/.test(verifierMessage(bv) || ''), verifierMessage(bv) || 'null')
+
+  const good = createVerifier()
+  good.tool('Bash', { command: 'npm test' })
+  good.text('All tests pass — 271 passed, 0 failed.')
+  const gv = good.verdict()
+  ok('a green backed by a real command is accepted', gv.ok === true && gv.unearned === false)
+  ok('there is no warning for an earned claim', verifierMessage(gv) === null)
+
+  const quiet = createVerifier()
+  quiet.tool('Read', { file_path: 'src/a.mjs' })
+  ok('a run that claims nothing is not flagged', quiet.verdict().ok === true)
+
+  const honest = createVerifier()
+  honest.tool('Bash', { command: 'npm test' })
+  honest.text('Tests pass, but I could not verify the runtime behaviour without launching the app.')
+  ok('a stated limitation is recorded', honest.verdict().statedLimits === true)
+
+  ok('the checklist tells the agent to verify the symptom, not the change',
+    /absence of the\s+problem/i.test(VERIFY_CHECKLIST))
+  ok('the checklist asks what was NOT checked',
+    /What did you NOT check/i.test(VERIFY_CHECKLIST))
+  ok('the checklist says a real failure is a correct outcome',
+    /Reporting a real failure is a correct outcome/i.test(VERIFY_CHECKLIST))
 }
 
 console.log('\n── Sandbox containment')
