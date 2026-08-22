@@ -58,6 +58,8 @@ import { trimMemory, memoryBrief, MEMORY_TEMPLATE } from './memory.mjs'
 import { chatArgs, remoteNotice } from './chat.mjs'
 import { validateBrief, BRIEF_TEMPLATE, briefPreamble } from './brief.mjs'
 import { createVerifier, verifierMessage, VERIFY_CHECKLIST } from './verify.mjs'
+import { createCommitter } from './committer.mjs'
+import { makeRequest, parseQueue, pending, answer, relayMessage, renderQueue, currentState, REASONS, APPROVALS_BRIEF } from './approvals.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -250,6 +252,11 @@ const CONFIG = {
   // how you tell one project's orchestrator from another's in the session list.
   remoteName: pick('remoteName', process.env.REMOTE_NAME, null),
 
+  // Lifecycle telemetry on the existing stream. On by default: it is additive
+  // JSON on a stream already being parsed, so the cost is a few tokens of log
+  // and the gain is seeing what a session did between tool calls.
+  hookEvents: PROJECT.hookEvents !== false && process.env.HOOK_EVENTS !== '0',
+
   // Context at which the orchestrator session is retired and a fresh one
   // seeded from the journal. Persistence must not be allowed to defeat the
   // context discipline the rest of this file is built around — see
@@ -348,6 +355,9 @@ const P = {
   // consumed by the wrong session and never reached the harness.
   currentSession: path.join(STATE, 'current_session'),
   cost: path.join(STATE, 'cost.jsonl'),
+  // Append-only. An answer is a NEW line, never an edit, so two terminals
+  // answering at once cannot clobber each other — last line for an id wins.
+  approvals: path.join(STATE, 'approvals.jsonl'),
   // Live usage observations off the stream. The account's real position is
   // knowable only while a call is in flight; ~/.claude.json is a cache with no
   // refresh guarantee (measured 87 minutes stale, still quoting a monthly limit
@@ -887,7 +897,15 @@ SESSION BUDGET: ${CONFIG.maxUnits} unit(s), and the context ceiling still applie
 Stop cleanly and write the journal line when you reach either.
 
 Claims still cost a command. Do not report a check you ran earlier in this
-session as if you just ran it — re-run it or say when it last passed.` : `${fs.readFileSync(P.prompt, 'utf8')}
+session as if you just ran it — re-run it or say when it last passed.${
+  (() => {
+    const open = pending(readApprovals())
+    return open.length
+      ? `\n\nSTILL WAITING ON A HUMAN (${open.length}): ${open.map(r => `${r.id} ${r.summary}`).join('; ')}.`
+        + ' Do not start these and do not work around them.'
+      : ''
+  })()
+}` : `${fs.readFileSync(P.prompt, 'utf8')}
 
 ${memoryBrief(readMemory())}
 
@@ -919,7 +937,9 @@ Whichever you reach first, stop cleanly. The supervisor restarts shortly, so
 stopping costs nothing. Always append the ${path.relative(REPO, P.journal)} line
 before stopping — it is the only thing that survives you.
 
-${VERIFY_CHECKLIST}`
+${VERIFY_CHECKLIST}
+
+${APPROVALS_BRIEF}`
 
   // Before anything is spent: does this brief name an artifact? Only fresh
   // conversations are checked — see briefGate().
@@ -990,6 +1010,20 @@ ${VERIFY_CHECKLIST}`
     // or thinking, so the dashboard can show that renderer-smith is running
     // but not what it is doing. Requires Claude Code >= 2.1.211.
     '--forward-subagent-text',
+    // Lifecycle events (PreToolUse, PostToolUse, Stop, Notification, ...) on
+    // the SAME stdout stream we already parse.
+    //
+    // The alternative — the pattern the observable-agent harnesses use — is a
+    // hook shim: point every hook at a tiny script that forwards its payload
+    // over a Unix socket to one resident process. That buys a control channel,
+    // because Claude Code reads the hook's JSON REPLY. We do not want the
+    // control channel: replying `{"decision":"block"}` on Stop is forced
+    // continuation, and that spends credits while a human is mid-answer.
+    //
+    // For the OBSERVE direction, which is all we want, this flag is the whole
+    // feature: no socket, no shim script, no second process, and nothing at
+    // the edge that can stall a turn by failing.
+    ...(CONFIG.hookEvents ? ['--include-hook-events'] : []),
   ]
 
   const sink = fs.createWriteStream(runLogPath, { flags: 'a' })
@@ -1884,6 +1918,106 @@ async function cmdChat(argv) {
   process.exit(code ?? 0)
 }
 
+// The single committer, bound to the real repo.
+//
+// Agents are told to write plain files and call this instead of running git
+// themselves. With one agent that is merely tidy; the moment a second one runs
+// it is the whole reason the repo does not corrupt, because concurrency on the
+// index drops to exactly one writer.
+function realCommitter() {
+  return createCommitter({
+    git(args) {
+      try {
+        const stdout = execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: 'pipe' })
+        return { status: 0, stdout, stderr: '' }
+      } catch (e) {
+        return {
+          status: e.status ?? 1,
+          stdout: e.stdout?.toString() ?? '',
+          stderr: e.stderr?.toString() ?? String(e.message ?? ''),
+        }
+      }
+    },
+    lockMtime(rel) {
+      try { return fs.statSync(path.join(REPO, rel)).mtimeMs } catch { return null }
+    },
+    removeLock(rel) {
+      try { fs.rmSync(path.join(REPO, rel), { force: true }) } catch {}
+    },
+    now: () => Date.now(),
+    sleep: ms => new Promise(r => setTimeout(r, ms)),
+    log: msg => logLine(msg),
+  }, { identity: { name: CONFIG.project, email: 'harness@local' } })
+}
+
+function readApprovals() {
+  try { return parseQueue(fs.readFileSync(P.approvals, 'utf8')) } catch { return [] }
+}
+function appendApproval(rec) {
+  ensureDirs()
+  fs.appendFileSync(P.approvals, JSON.stringify(rec) + '\n')
+}
+
+// Called BY the session, via `harness ask`. Writing the request is the whole
+// action: the session is expected to stop that line of work and carry on with
+// something else, not to block waiting for an answer. A blocked session is a
+// session paying for a context window while a human sleeps.
+function cmdAsk(argv) {
+  const [reason, ...rest] = argv
+  const summary = rest.join(' ').trim()
+  if (!REASONS.includes(reason) || !summary) {
+    console.error(`usage: harness ask <${REASONS.join('|')}> "<one line>"`)
+    process.exit(1)
+  }
+  let sid = null
+  try { sid = fs.readFileSync(P.currentSession, 'utf8').trim() || null } catch {}
+  const id = `a${String(readApprovals().length + 1).padStart(3, '0')}`
+  const rec = makeRequest({ id, reason, summary, session: sid, ts: new Date().toISOString() })
+  appendApproval(rec)
+  logLine(`APPROVAL REQUESTED ${id} [${reason}] ${summary}`)
+  console.log(`${id} queued — a human must answer before this proceeds.`)
+  console.log('Do NOT wait on it. Continue with other work, or stop cleanly.')
+}
+
+function cmdApprovals() {
+  console.log(renderQueue(readApprovals()))
+}
+
+function cmdAnswer(status, argv) {
+  const [id, ...noteParts] = argv
+  if (!id) { console.error(`usage: harness ${status === 'approved' ? 'approve' : 'reject'} <id> [note]`); process.exit(1) }
+  const records = readApprovals()
+  const rec = answer(records, id, status, { note: noteParts.join(' ') || null, ts: new Date().toISOString() })
+  if (!rec) {
+    const known = currentState(records).find(r => r.id === id)
+    console.error(known ? `${id} was already ${known.status}.` : `no pending approval "${id}".`)
+    process.exit(1)
+  }
+  appendApproval(rec)
+  // The answer reaches the session the same way every other steer does. The
+  // note travels with it: "yes, but cap it at $5" is the usual shape of a real
+  // answer, and dropping the condition would be worse than refusing outright.
+  const msg = relayMessage(rec)
+  say(msg, { supervisor: true })
+  logLine(`APPROVAL ${status.toUpperCase()} ${id}`)
+  console.log(`${id} ${status} — relayed to the session.`)
+}
+
+async function cmdCommit(argv) {
+  ensureDirs()
+  const message = argv.join(' ').trim()
+  if (!message) {
+    console.error('usage: harness commit "<message>"')
+    process.exit(1)
+  }
+  const r = await realCommitter().commit(message)
+  if (r.ok && r.kind === 'clean') { console.log('nothing to commit — tree already clean'); return }
+  if (r.ok) { console.log(`committed (attempt ${r.attempts})`); return }
+  console.error(`commit failed after ${r.attempts} attempt(s): ${r.kind}`)
+  if (r.output) console.error(r.output.trim().split('\n').slice(0, 5).join('\n'))
+  process.exit(1)
+}
+
 function cmdBrief(argv) {
   ensureDirs()
   const rel = path.relative(REPO, P.prompt)
@@ -2262,6 +2396,11 @@ switch (cmd) {
   case 'say': say(rest.join(' ')); console.log('queued for delivery'); break
   case 'sprint': await cmdSprint(); break
   case 'brief': cmdBrief(rest); break
+  case 'commit': await cmdCommit(rest); break
+  case 'ask': cmdAsk(rest); break
+  case 'approvals': cmdApprovals(); break
+  case 'approve': cmdAnswer('approved', rest); break
+  case 'reject': cmdAnswer('rejected', rest); break
   case 'budget': cmdBudget(rest[0]); break
   case 'status': cmdStatus(); break
   case 'usage': cmdUsage(process.argv.slice(3)); break
@@ -2280,6 +2419,10 @@ switch (cmd) {
   ui              live dashboard on :${CONFIG.uiPort} + message channel
   say <message>   send a message to the running agent
   brief [init]    check the brief has a Goal and a Deliverable (init writes one)
+  commit "<msg>"  the ONLY way to commit — one writer, retry, stale-lock recovery
+  approvals       what is waiting on you
+  approve <id> [note] | reject <id> [note]
+  ask <reason> "<line>"   (agents call this; reasons: destructive|spend|scope|conflict)
   status          one-screen summary
   usage           live cost meter — window, credits, tokens, cache (--json)
   pause | resume  skip ticks without unloading launchd

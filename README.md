@@ -218,10 +218,97 @@ Eviction is **lossless** — overflow moves to `.harness-memory.archive.md`, whi
 can grep. Nothing is summarised, so nothing can be summarised wrongly. A memory file that
 does not have these headings is left byte-for-byte alone rather than restructured.
 
+## Reaching it from your phone
+
+`harness chat` spawns a real interactive Claude Code session, so it can carry Claude Code's
+own Remote Control flag. That is the whole answer to "I am not at my Mac" — the orchestrator
+registers itself and the Claude app reaches **this** session, the same one the scheduler
+drives. No bespoke UI, no auth layer, nothing listening on a non-loopback port.
+
+```json
+{ "remoteControl": true, "remoteName": "JARVIS" }
+```
+
+Off by default. Registering a session that runs with `--dangerously-skip-permissions` for
+remote reach is a decision worth making deliberately, not one to inherit by cloning.
+
+## The brief
+
+A brief has four parts, and one of them is load-bearing:
+
+| | |
+|---|---|
+| **Goal** | the outcome, not the steps. Steps make the orchestrator a slow keyboard |
+| **Constraints** | what must not change, where the work lives, conventions to follow |
+| **Budget** | what the work is worth |
+| **Deliverable** | the artifact that proves done |
+
+```bash
+harness brief init     # writes the template
+harness brief          # refuses if Goal or Deliverable is missing
+```
+
+Goal and Deliverable are required; the other two warn, because "none" is a real answer and
+the harness already carries its own dollar cap. A brief with no artifact in it is the
+cheapest way to lose a night of tokens — the agent does not stall, it confidently builds the
+wrong thing and reports success. Free-prose briefs warn rather than block, so an existing
+install still runs after upgrading.
+
+## Claims cost a command
+
+Generating a claim is cheaper than checking one, so an unpressured agent drifts to the cheap
+path — not from dishonesty, from economics. A confident "✅ all tests pass" that nobody ran
+is more expensive than an error, because you trust it.
+
+Every session is given the checklist (*did you run it or imagine it; did you verify the
+symptom or just the change; what did you NOT check*), and the harness watches what a run
+**claims** against what it actually **ran**. A green that nothing could have produced is
+flagged on the run record and printed at the end.
+
+Advisory, not blocking. A false positive that kills a good session costs more than the claim
+it caught, and the breaker and the budget cap already own the hard stops.
+
+## One writer for git
+
+Git takes an exclusive `.git/index.lock` to stage or commit. That is fine for a person typing
+one command; two agents finishing in the same second get contention, half-applied state, or —
+worst — an orphaned lock from a killed process that blocks **every** future commit by anyone.
+
+So agents write plain files and never run git. One process commits:
+
+```bash
+harness commit "feat: the thing"
+```
+
+Serialised, with retry and growing backoff, and **age-based stale-lock recovery** — a lock
+untouched for ten seconds belongs to a dead process and is cleared before the attempt rather
+than after the failure. A fixed identity with `commit.gpgsign=false`, so an unattended
+committer can never hang on a signing prompt.
+
+## Approvals
+
+Every other stop here is the machine deciding it should not continue. This is the other case:
+where it has no business deciding at all.
+
+```bash
+harness approvals                  # what is waiting on you
+harness approve a001 "under $20"   # the condition travels to the agent
+harness reject a001 "not this way"
+```
+
+Four things escalate — **destructive**, **spend**, **scope**, **conflict** — and everything
+else stays autonomous, because a queue that catches everything is a queue nobody answers and
+a stalled approval is a stalled build. The default when a case is genuinely ambiguous is
+*ask*: a build that waits is recoverable, and `rm -rf` on the wrong directory at 3am is not.
+
+The agent files a request with `harness ask` and is told explicitly **not** to block on it.
+The queue is append-only — an answer is a new line, never an edit — so two terminals
+answering at once cannot clobber each other.
+
 ## Tests
 
 ```bash
-npm test          # 254 assertions
+npm test          # 351 assertions
 npm run test:stress
 ```
 

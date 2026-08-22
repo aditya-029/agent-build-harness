@@ -33,6 +33,8 @@ import { parseMemory, trimMemory, memoryBrief, MEMORY_TEMPLATE } from '../src/me
 import { chatArgs, hasFlag, remoteNotice } from '../src/chat.mjs'
 import { parseBrief, validateBrief, briefPreamble, BRIEF_TEMPLATE } from '../src/brief.mjs'
 import { createVerifier, verifierMessage, findClaims, isEvidence, VERIFY_CHECKLIST } from '../src/verify.mjs'
+import { createCommitter, classifyGitError, isStaleLock, backoffMs, commitArgs, STALE_LOCK_MS } from '../src/committer.mjs'
+import { makeRequest, parseQueue, currentState, pending, answer, relayMessage, renderQueue, REASONS, APPROVALS_BRIEF } from '../src/approvals.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -1367,6 +1369,199 @@ console.log('\n── Self-verification: a claim costs a command')
     /What did you NOT check/i.test(VERIFY_CHECKLIST))
   ok('the checklist says a real failure is a correct outcome',
     /Reporting a real failure is a correct outcome/i.test(VERIFY_CHECKLIST))
+}
+
+console.log('\n── Single committer: one writer for git')
+{
+  ok('a clean tree is a success, not a failure',
+    classifyGitError('', 'nothing to commit, working tree clean') === 'clean')
+  ok('a lock collision is recognised',
+    classifyGitError("fatal: Unable to create '/r/.git/index.lock': File exists.") === 'locked')
+  ok('anything else is a plain error',
+    classifyGitError('fatal: not a git repository') === 'error')
+
+  ok('a fresh lock is left alone', !isStaleLock(1_000_000, 1_000_500))
+  ok('a lock untouched past the threshold is stale',
+    isStaleLock(1_000_000, 1_000_000 + STALE_LOCK_MS))
+  ok('a missing mtime is never stale', !isStaleLock(null, Date.now()))
+
+  ok('backoff grows', backoffMs(0) < backoffMs(1) && backoffMs(1) < backoffMs(5))
+
+  const args = commitArgs('msg')
+  ok('the committer never waits on a GPG prompt', args.includes('commit.gpgsign=false'))
+  ok('the committer uses a fixed identity so it cannot block on user.name',
+    args.some(a => a.startsWith('user.name=')) && args.some(a => a.startsWith('user.email=')))
+
+  // A fake git that can be made to fail on demand. The point of injecting IO:
+  // this ladder is tested against a known git, not whatever the developer's
+  // real repository happens to be doing.
+  const mkIo = (script, { lockMtime = null, now = 1_000_000 } = {}) => {
+    const calls = []
+    const removed = []
+    let lock = lockMtime
+    return {
+      calls, removed,
+      io: {
+        git(a) { calls.push(a.join(' ')); return (script.shift() || { status: 0, stdout: '', stderr: '' }) },
+        lockMtime() { return lock },
+        removeLock(p) { removed.push(p); lock = null },
+        now: () => now,
+        sleep: async () => {},
+      },
+    }
+  }
+
+  {
+    const { io, calls } = mkIo([])
+    const r = await createCommitter(io).commit('m')
+    ok('a normal commit succeeds on the first attempt', r.ok && r.attempts === 1 && r.kind === 'committed')
+    ok('it stages before committing', calls[0] === 'add -A')
+  }
+
+  {
+    const { io } = mkIo([
+      { status: 0, stdout: '', stderr: '' },
+      { status: 1, stdout: 'nothing to commit, working tree clean', stderr: '' },
+    ])
+    const r = await createCommitter(io).commit('m')
+    ok('an already-clean tree returns ok WITHOUT retrying',
+      r.ok && r.kind === 'clean' && r.attempts === 1)
+  }
+
+  {
+    // Locked twice, then free. This is transient contention and must resolve.
+    const { io } = mkIo([
+      { status: 0 }, { status: 1, stderr: "Unable to create '.git/index.lock': File exists." },
+      { status: 0 }, { status: 1, stderr: "Unable to create '.git/index.lock': File exists." },
+      { status: 0 }, { status: 0 },
+    ])
+    const r = await createCommitter(io).commit('m')
+    ok('a lock collision is retried until it clears', r.ok && r.attempts === 3, JSON.stringify(r))
+  }
+
+  {
+    const script = []
+    for (let i = 0; i < 20; i++) script.push({ status: 0 }, { status: 1, stderr: 'index.lock: File exists' })
+    const { io } = mkIo(script)
+    const r = await createCommitter(io).commit('m')
+    ok('a lock that never clears gives up quietly rather than spinning',
+      !r.ok && r.kind === 'locked' && r.attempts === 6)
+  }
+
+  {
+    // The failure retries alone cannot fix: an orphaned lock from a dead
+    // process never clears itself, so age-based cleanup is what turns
+    // "a crashed agent bricked our commits" into a non-event.
+    const now = 1_000_000
+    const { io, removed } = mkIo([{ status: 0 }, { status: 0 }],
+      { lockMtime: now - STALE_LOCK_MS - 1, now })
+    const r = await createCommitter(io).commit('m')
+    ok('a stale lock is cleared before the attempt, not after the failure',
+      r.ok && removed.length === 1)
+  }
+
+  {
+    const now = 1_000_000
+    const { io, removed } = mkIo([{ status: 0 }, { status: 0 }], { lockMtime: now - 500, now })
+    await createCommitter(io).commit('m')
+    ok('a FRESH lock is never deleted — that would corrupt a live write',
+      removed.length === 0)
+  }
+
+  {
+    const { io } = mkIo([{ status: 0 }, { status: 128, stderr: 'fatal: not a git repository' }])
+    const r = await createCommitter(io).commit('m')
+    ok('a non-lock failure is reported at once, not retried six times',
+      !r.ok && r.kind === 'error' && r.attempts === 1)
+  }
+
+  {
+    // Two overlapping commits inside one process would recreate, in miniature,
+    // the exact race this module removes. They must queue.
+    const order = []
+    const io = {
+      git(a) { order.push(a[0] === 'add' ? 'add' : 'commit'); return { status: 0, stdout: '', stderr: '' } },
+      lockMtime: () => null, removeLock() {}, now: () => 1, sleep: async () => {},
+    }
+    const c = createCommitter(io)
+    await Promise.all([c.commit('a'), c.commit('b')])
+    ok('concurrent commits are serialised, never interleaved',
+      order.join(',') === 'add,commit,add,commit', order.join(','))
+  }
+
+  {
+    // A throwing git must not wedge every future commit behind a rejected
+    // promise — the queue has to survive its own failures.
+    let first = true
+    const io = {
+      git() { if (first) { first = false; throw new Error('boom') } return { status: 0, stdout: '', stderr: '' } },
+      lockMtime: () => null, removeLock() {}, now: () => 1, sleep: async () => {},
+    }
+    const c = createCommitter(io)
+    await c.commit('a').catch(() => {})
+    const second = await c.commit('b')
+    ok('a thrown error does not wedge the queue for every later commit', second.ok)
+  }
+}
+
+console.log('\n── Approvals: the human as a designed exit')
+{
+  const req = (id, reason, summary) => makeRequest({ id, reason, summary, ts: 't' })
+
+  ok('a request needs a recognised reason',
+    (() => { try { req('a1', 'vibes', 'do a thing'); return false } catch { return true } })())
+  ok('a request needs a real summary — "approve this?" is not a question',
+    (() => { try { req('a1', 'spend', '   '); return false } catch { return true } })())
+  ok('the four escalation reasons are exactly the short list',
+    REASONS.join(',') === 'destructive,spend,scope,conflict')
+  ok('a new request starts pending', req('a1', 'spend', 'buy a domain').status === 'pending')
+
+  const log = [req('a1', 'spend', 'buy a domain'), req('a2', 'destructive', 'force-push main')]
+  ok('both requests are pending', pending(log).length === 2)
+
+  // The file is append-only: an answer is a NEW line, never an edit.
+  const ans = answer(log, 'a1', 'approved', { note: 'cap it at $5', ts: 't2' })
+  const after = [...log, ans]
+  ok('the last line for an id wins', currentState(after).find(r => r.id === 'a1').status === 'approved')
+  ok('answering one leaves the other pending',
+    pending(after).length === 1 && pending(after)[0].id === 'a2')
+
+  ok('a condition on the answer reaches the agent',
+    /cap it at \$5/.test(relayMessage(ans)), relayMessage(ans))
+  ok('an approval tells the agent to stay inside what was approved',
+    /stay within exactly what was approved/i.test(relayMessage(ans)))
+  ok('a rejection tells the agent not to do it',
+    /Do not do it/i.test(relayMessage(answer(log, 'a2', 'rejected', {}))))
+  ok('a pending request has no relay message', relayMessage(log[0]) === null)
+
+  // A stale terminal must not overwrite a decision already made elsewhere.
+  ok('an already-answered request cannot be re-answered',
+    answer(after, 'a1', 'rejected', {}) === null)
+  ok('answering an unknown id returns null rather than inventing one',
+    answer(log, 'nope', 'approved', {}) === null)
+  ok('"pending" is not a valid answer',
+    (() => { try { answer(log, 'a1', 'pending', {}); return false } catch { return true } })())
+
+  // A torn write must not cost the rest of the queue.
+  const jsonl = log.map(r => JSON.stringify(r)).join('\n') + '\n{"id":"a3","trunc'
+  ok('a corrupt trailing line does not lose the readable records', parseQueue(jsonl).length === 2)
+  ok('an empty queue parses to nothing', parseQueue('').length === 0)
+
+  ok('an empty queue renders as nothing pending', /no approvals pending/.test(renderQueue([])))
+  ok('the queue render tells you how to answer it', /harness approve/.test(renderQueue(log)))
+
+  // The escalation brief must also say what NOT to send, or the queue fills
+  // with trivia and stops being answered at all.
+  ok('the brief names all four reasons',
+    REASONS.every(r => APPROVALS_BRIEF.includes(r)))
+  ok('the brief says everything else stays autonomous',
+    /Everything else is yours/i.test(APPROVALS_BRIEF))
+  ok('the brief defaults to ASK when genuinely unsure',
+    /genuinely unsure, ASK/i.test(APPROVALS_BRIEF))
+  ok('the brief warns against batching trivia into the queue',
+    /queue nobody answers/i.test(APPROVALS_BRIEF))
+  ok('the brief tells the agent NOT to block waiting',
+    /file it, do not follow it/i.test(APPROVALS_BRIEF) || /STOP that line of work/i.test(APPROVALS_BRIEF))
 }
 
 console.log('\n── Sandbox containment')
