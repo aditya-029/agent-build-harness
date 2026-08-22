@@ -1,0 +1,9 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785463200,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.8}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.9}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.91}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.92}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.98}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.99}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785471600,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"num_turns":24,"result":"You've hit your session limit · resets 2:20pm (Australia/Melbourne)"}
+{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"num_turns":1,"result":"You've hit your session limit · resets 2:20pm (Australia/Melbourne)"}

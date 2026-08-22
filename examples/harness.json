@@ -1,0 +1,32 @@
+{
+  "//": "Copy to <your-repo>/.harness.json. Every key is optional.",
+
+  "project": "My Project",
+  "label": "com.harness.my-project",
+
+  "journalPath": "logs/journal.jsonl",
+  "blockedPath": "logs/blocked.md",
+  "promptPath": ".harness-prompt.md",
+
+  "intervalSec": 900,
+  "maxUnits": 8,
+  "maxCtxWarnTokens": 70000,
+  "maxCtxHandoffTokens": 90000,
+
+  "budgetCapUsd": 110,
+  "creditCapUsd": 50,
+  "allowOverage": false,
+  "usageFloorPct": 95,
+  "sevenDayFloorPct": 95,
+
+  "errorBackoffSec": 1800,
+  "transientBackoffSec": 120,
+  "idleBackoffCapSec": 21600,
+
+  "bookkeepingPaths": ["logs/journal.jsonl"],
+
+  "compactRules": [
+    "Never delete or weaken a failing test to go green.",
+    "src/schema.ts is the single source of truth for every literal."
+  ]
+}

@@ -1,0 +1,4 @@
+node_modules/
+.DS_Store
+# Harness runtime state, when the harness is pointed at THIS repo.
+.harness/

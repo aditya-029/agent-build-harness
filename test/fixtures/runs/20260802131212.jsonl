@@ -1,0 +1,4 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785690000,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.93}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785690000,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.94}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785690000,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.95}}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":5,"result":"[scrubbed: session output]"}

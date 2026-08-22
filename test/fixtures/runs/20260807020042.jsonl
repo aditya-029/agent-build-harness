@@ -1,0 +1,6 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1786081800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":18,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":3,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":5,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":2,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":11,"result":"[scrubbed: session output]"}

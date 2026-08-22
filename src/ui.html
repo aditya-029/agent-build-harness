@@ -1,0 +1,118 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>build harness</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b0d10;color:#d6dde6;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}
+header{display:flex;align-items:center;gap:14px;padding:10px 16px;border-bottom:1px solid #1e242c;background:#0e1116;flex-wrap:wrap}
+h1{font-size:13px;margin:0;font-weight:600;letter-spacing:.02em}
+.pill{padding:2px 9px;border-radius:99px;font-size:11px;border:1px solid #2a323c;color:#8b96a3}
+.armed{color:#6ee7a8;border-color:#1d4735;background:#0f2018}
+.paused{color:#fbbf24;border-color:#4a3a12;background:#1f1806}
+.stopped,.unloaded{color:#8b96a3}
+.spacer{flex:1}
+button{background:#161b22;color:#c9d3de;border:1px solid #2a323c;border-radius:6px;padding:4px 11px;font:inherit;font-size:11px;cursor:pointer}
+button:hover{background:#1d242e;border-color:#3a4550}
+main{display:grid;grid-template-columns:200px 1fr;height:calc(100vh - 96px)}
+aside{border-right:1px solid #1e242c;overflow:auto;padding:8px}
+.sess{padding:7px 9px;border-radius:6px;cursor:pointer;margin-bottom:3px;border:1px solid transparent}
+.sess:hover{background:#141920}
+.sess.on{background:#151c26;border-color:#2b3947}
+.sess .t{font-size:11px;color:#e3eaf2}
+.sess .m{font-size:10px;color:#6f7d8c;margin-top:2px}
+section{overflow:auto;padding:14px 18px}
+.node{border:1px solid #1e242c;border-radius:8px;margin-bottom:10px;background:#0e1116}
+.node.sub{margin-left:24px;border-left:2px solid #2d4a63}
+.nh{display:flex;align-items:center;gap:9px;padding:8px 11px;border-bottom:1px solid #171d24}
+.dot{width:7px;height:7px;border-radius:50%;flex:none}
+.run{background:#6ee7a8;box-shadow:0 0 0 3px #6ee7a82a}
+.fin{background:#4a5764}
+.nt{font-weight:600;color:#e8eef5;font-size:12px}
+.nd{color:#7b8898;font-size:11px}
+.body{padding:5px 11px 9px;max-height:300px;overflow:auto}
+.e{display:flex;gap:8px;padding:2px 0;border-top:1px solid #12171d}
+.e:first-child{border-top:none}
+.k{flex:none;width:62px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:#5d6b7a;padding-top:1px}
+.x{white-space:pre-wrap;word-break:break-word;flex:1;color:#b9c4d0}
+.k-tool+.x{color:#8fb4d9}.k-spawn+.x{color:#c4a6f0}.k-text+.x{color:#dbe4ee}
+.k-thinking+.x{color:#6f7d8c;font-style:italic}.k-retry+.x{color:#fbbf24}
+.k-result+.x{color:#6ee7a8}.k-done+.x{color:#5d6b7a}
+footer{border-top:1px solid #1e242c;background:#0e1116;padding:8px 16px}
+.row{display:flex;gap:8px;align-items:center}
+input{flex:1;background:#0b0e12;border:1px solid #2a323c;border-radius:6px;color:#dbe4ee;padding:7px 10px;font:inherit}
+input:focus{outline:none;border-color:#3d6285}
+.pend{color:#fbbf24;font-size:11px;padding:5px 2px 0}
+.hint{color:#5d6b7a;font-size:11px}
+</style></head><body>
+<header>
+  <h1 id="project-name">build harness</h1>
+  <span class="pill" id="sched">—</span>
+  <span class="pill" id="usage">—</span>
+  <span class="pill" id="cost">—</span>
+  <span class="spacer"></span>
+  <button onclick="ctl('pause')">Pause</button>
+  <button onclick="ctl('resume')">Resume</button>
+  <button onclick="ctl('start')">Arm</button>
+  <button onclick="ctl('stop')">Stop</button>
+</header>
+<main>
+  <aside id="list"></aside>
+  <section id="tree"></section>
+</main>
+<footer>
+  <div class="row">
+    <input id="msg" placeholder="Message the running agent&hellip;   prefix @reviewer: to target a subagent" autocomplete="off">
+    <button onclick="send()">Send</button>
+    <button onclick="ctl('clear-inbox')">Clear</button>
+  </div>
+  <div class="pend" id="pend"></div>
+</footer>
+<script>
+let state = { sessions: [] }, sel = null
+const esc = s => String(s ?? '').replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]))
+
+new EventSource('/stream').onmessage = e => { state = JSON.parse(e.data); render() }
+
+function render() {
+  const sc = document.getElementById('sched')
+  sc.textContent = state.scheduler; sc.className = 'pill ' + state.scheduler
+  const u = state.usage || {}
+  document.getElementById('usage').textContent = `5h ${u.five ?? 0}% · 7d ${u.seven ?? 0}% (floor ${u.floor ?? 0}%)`
+  document.getElementById('cost').textContent = '$' + (state.todayCost || 0).toFixed(3) + ' today'
+  document.getElementById('pend').textContent =
+    state.pending?.length ? 'queued, delivers on the agent’s next tool call: ' + state.pending.join('  ·  ') : ''
+
+  document.getElementById('list').innerHTML = state.sessions.map(s =>
+    `<div class="sess${s.id === sel ? ' on' : ''}" onclick="sel='${s.id}';render()">
+       <div class="t">${esc(s.label)}</div>
+       <div class="m">${esc(s.status)}${s.cost ? ' · $' + s.cost.toFixed(3) : ''}${s.turns ? ' · ' + s.turns + 't' : ''}</div>
+     </div>`).join('')
+
+  const s = state.sessions.find(x => x.id === sel) || state.sessions[0]
+  const tree = document.getElementById('tree')
+  if (!s) { tree.innerHTML = '<div class="hint">No sessions yet. Arm the scheduler, or open an interactive Claude session in this repo &mdash; hooks capture both.</div>'; return }
+  sel = s.id
+  tree.innerHTML = s.nodes.map(n => `
+    <div class="node${n.id === 'main' ? '' : ' sub'}">
+      <div class="nh">
+        <span class="dot ${n.status === 'running' ? 'run' : 'fin'}"></span>
+        <span class="nt">${esc(n.type)}</span>
+        ${n.desc ? `<span class="nd">${esc(n.desc)}</span>` : ''}
+      </div>
+      <div class="body">${n.entries.slice().reverse().map(e =>
+        `<div class="e"><span class="k k-${e.kind}">${e.kind}</span><span class="x">${esc(e.text)}</span></div>`).join('')}
+      </div>
+    </div>`).join('')
+}
+
+async function post(url, payload) {
+  await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+}
+async function send() {
+  const i = document.getElementById('msg')
+  if (!i.value.trim()) return
+  await post('/inbox', { message: i.value }); i.value = ''
+}
+const ctl = action => post('/control', { action })
+document.getElementById('msg').addEventListener('keydown', e => { if (e.key === 'Enter') send() })
+</script></body></html>

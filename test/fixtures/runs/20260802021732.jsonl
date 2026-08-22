@@ -1,0 +1,10 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.56}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.57}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.57}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.58}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.59}}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":25,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":3,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":2,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":3,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":7,"result":"[scrubbed: session output]"}

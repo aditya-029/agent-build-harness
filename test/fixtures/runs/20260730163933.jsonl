@@ -1,0 +1,2 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785434400,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"num_turns":1,"result":"You've hit your session limit · resets 4am (Australia/Melbourne)"}

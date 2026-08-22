@@ -1,0 +1,2 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1786162800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":null,"num_turns":11,"result":"API Error: Connection closed mid-response. The response above may be incomplete."}

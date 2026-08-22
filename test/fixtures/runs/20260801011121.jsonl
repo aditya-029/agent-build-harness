@@ -1,0 +1,18 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.92}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.93}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.94}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.95}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.96}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.97}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.98}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":null,"utilization":0.99}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1785562800,"rateLimitType":"five_hour","isUsingOverage":false,"overageStatus":"rejected","utilization":null}}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":24,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":1,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":9,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":18,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":3,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":3,"result":"[scrubbed: session output]"}
+{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","api_error_status":429,"num_turns":7,"result":"You've hit your session limit · resets 3:40pm (Australia/Melbourne)"}

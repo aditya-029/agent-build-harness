@@ -1,0 +1,2 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","resetsAt":1786068000,"rateLimitType":"seven_day","isUsingOverage":false,"overageStatus":null,"utilization":0.86}}
+{"type":"result","is_error":false,"subtype":"success","terminal_reason":"completed","api_error_status":null,"num_turns":9,"result":"[scrubbed: session output]"}
