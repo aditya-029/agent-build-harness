@@ -28,6 +28,7 @@
  */
 export function chatArgs({
   sessionId, fresh, prompt, model,
+  permissionMode = 'auto', unsafeBypass = false,
   remoteControl = false, remoteName = null, project = 'harness',
   extra = [],
 }) {
@@ -42,13 +43,17 @@ export function chatArgs({
 
   // Same flags the headless tick uses, minus the headless ones: this is a real
   // TUI and the child owns the terminal.
-  args.push('--model', model, '--dangerously-skip-permissions', '--strict-mcp-config')
+  if (model) args.push('--model', model)
+  if (unsafeBypass) args.push('--dangerously-skip-permissions')
+  else args.push('--permission-mode', permissionMode)
+  args.push('--strict-mcp-config')
 
   // Remote Control makes THIS session — the one the scheduler drives —
   // reachable from the Claude app. No bespoke UI, no auth layer, nothing
   // listening on a non-loopback port; it is a flag on a process that already
   // exists. Off unless asked for, because registering a session running with
-  // --dangerously-skip-permissions for remote reach is a deliberate choice.
+  // Remote reach is always deliberate. An unsafe bypass, when explicitly
+  // configured, remains visible in argv rather than being an invisible default.
   if (remoteControl && !hasFlag(extra, '--remote-control')) {
     const name = remoteName || project
     args.push('--remote-control', name)

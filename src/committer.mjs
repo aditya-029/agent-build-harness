@@ -67,6 +67,22 @@ export function commitArgs(message, { name = 'harness', email = 'harness@local' 
   ]
 }
 
+/** Stage only the files a worker declares it owns. Broad staging is explicit. */
+export function stageArgs({ paths = [], all = false } = {}) {
+  if (all) return ['add', '-A']
+  if (!Array.isArray(paths) || paths.length === 0) {
+    throw new Error('commit scope required: pass paths, or explicitly opt into all')
+  }
+  const clean = paths.map(p => String(p).trim())
+  for (const p of clean) {
+    if (!p || p === '.' || p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p)
+      || p.split(/[\\/]/).includes('..')) {
+      throw new Error(`unsafe commit path: ${p || '(empty)'}`)
+    }
+  }
+  return ['add', '--', ...clean]
+}
+
 /**
  * The single committer.
  *
@@ -93,7 +109,7 @@ export function createCommitter(io, opts = {}) {
   // remove — so they queue instead.
   let tail = Promise.resolve()
 
-  async function attemptOnce(message) {
+  async function attemptOnce(message, scope) {
     // Clear an orphaned lock BEFORE trying, not after failing. A lock left by
     // a process that died an hour ago will never clear itself, and retrying
     // into it just burns the whole ladder before reporting a failure whose
@@ -104,7 +120,7 @@ export function createCommitter(io, opts = {}) {
       io.removeLock(lockPath)
     }
 
-    const add = io.git(['add', '-A'])
+    const add = io.git(stageArgs(scope))
     if (add.status !== 0) {
       const kind = classifyGitError(add.stderr, add.stdout)
       return { done: kind !== 'locked', ok: false, kind, output: add.stderr || add.stdout }
@@ -121,14 +137,18 @@ export function createCommitter(io, opts = {}) {
   }
 
   /**
-   * Commit everything currently in the tree.
+   * Commit a declared set of repo-relative paths. `all: true` is an explicit
+   * escape hatch for a human-controlled whole-tree commit.
    * @returns {Promise<{ok: boolean, kind: string, attempts: number, output?: string}>}
    */
-  function commit(message) {
+  function commit(message, scope = {}) {
+    try { stageArgs(scope) } catch (e) {
+      return Promise.resolve({ ok: false, kind: 'scope_required', attempts: 0, output: e.message })
+    }
     const job = tail.then(async () => {
       let last = null
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        last = await attemptOnce(message)
+        last = await attemptOnce(message, scope)
         if (last.done) return { ...last, attempts: attempt + 1 }
         await io.sleep(backoffMs(attempt))
       }

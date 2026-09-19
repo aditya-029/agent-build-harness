@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-// An unattended build harness for Claude Code — scheduler, observer, and
-// control plane in one. Points at a target git repository, wakes on a
+// An unattended cross-model build harness — scheduler, observer, and control
+// plane in one. Points at a target git repository, wakes on a
 // schedule, runs a build session, meters what it spends, and parks itself with
 // a reason when it should stop.
 //
 //   harness <command>            (with HARNESS_REPO set, or run inside the repo)
 //
 //     tick            run one build session   (launchd calls this)
-//     chat            TALK TO THE ORCHESTRATOR — opens the real Claude Code
-//                     TUI on the very session the scheduler drives
-//     hook            Claude Code hook target (settings.json calls this)
+//     chat            TALK TO THE ORCHESTRATOR — opens the provider's real TUI
+//                     on the very session the scheduler drives
+//     hook            Claude Code hook target (Claude settings.json calls this)
 //     ui              live dashboard + message channel
 //     say <message>   send a message to the running agent
 //     sprint          run sessions back-to-back until a guard stops it
@@ -55,11 +55,16 @@ import {
 } from './classify.mjs'
 import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from './breaker.mjs'
 import { trimMemory, memoryBrief, MEMORY_TEMPLATE } from './memory.mjs'
-import { chatArgs, remoteNotice } from './chat.mjs'
+import { remoteNotice } from './chat.mjs'
+import {
+  providerCapabilities, providerSessionExists, headlessInvocation,
+  interactiveInvocation, queueInvocation, normalizeProviderEvent,
+} from './providers.mjs'
 import { validateBrief, BRIEF_TEMPLATE, briefPreamble } from './brief.mjs'
 import { createVerifier, verifierMessage, VERIFY_CHECKLIST } from './verify.mjs'
 import { createCommitter } from './committer.mjs'
 import { makeRequest, parseQueue, pending, answer, relayMessage, renderQueue, currentState, REASONS, APPROVALS_BRIEF } from './approvals.mjs'
+import { sanitizedEnv } from './environment.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -92,9 +97,21 @@ const PROJECT = loadProjectConfig(REPO)
 // A project value wins over the default; an env var wins over both, so a
 // one-off `MAX_UNITS=2 harness tick` still works without editing the file.
 const pick = (key, envVal, dflt) => envVal ?? PROJECT[key] ?? dflt
+const PROVIDER_NAME = String(pick('provider', process.env.AGENT_PROVIDER, 'claude')).toLowerCase()
+let PROVIDER
+try { PROVIDER = providerCapabilities(PROVIDER_NAME) } catch (e) {
+  console.error(`harness: ${e.message}`)
+  process.exit(1)
+}
+const PROJECT_PROVIDER = String(PROJECT.provider ?? 'claude').toLowerCase()
+const providerPick = (key, envVal, dflt) => envVal
+  ?? PROJECT.providers?.[PROVIDER_NAME]?.[key]
+  ?? (PROJECT_PROVIDER === PROVIDER_NAME ? PROJECT[key] : undefined)
+  ?? dflt
 
 // ─────────────────────────────────────────────────────────── configuration
 const CONFIG = {
+  provider: PROVIDER_NAME,
   // launchd job label AND the identity of this harness instance on the machine.
   // Two projects running the harness must not share it or they fight over the
   // same launchd job. Derived from the repo directory name unless set.
@@ -104,10 +121,23 @@ const CONFIG = {
   project: pick('project', process.env.HARNESS_PROJECT, path.basename(REPO)),
   intervalSec: num(pick('intervalSec', process.env.HARNESS_INTERVAL, 900)),
 
-  // Model is a knob, never a hardcode — the harness is model-agnostic and the
-  // per-agent tiering lives in CLAUDE.md's org table and .claude/agents/*.md.
-  model: pick('model', process.env.AGENT_MODEL, 'sonnet'),
-  fallbackModel: pick('fallbackModel', process.env.AGENT_FALLBACK, 'haiku'),
+  // Model is a knob, never a hardcode. Per-role routing belongs in the target
+  // repository's shared instructions and agent definitions.
+  model: providerPick('model', process.env.AGENT_MODEL, PROVIDER_NAME === 'claude' ? 'sonnet' : null),
+  fallbackModel: providerPick('fallbackModel', process.env.AGENT_FALLBACK, PROVIDER_NAME === 'claude' ? 'haiku' : null),
+  // Provider safety is explicit. Neither adapter silently disables its own
+  // permission boundary. Claude uses auto mode; Codex writes only inside the
+  // workspace. A bypass has to be opted into in project config.
+  permissionMode: providerPick('permissionMode', process.env.AGENT_PERMISSION_MODE, 'auto'),
+  sandbox: providerPick('sandbox', process.env.AGENT_SANDBOX, 'workspace-write'),
+  unsafeBypass: PROJECT.unsafeBypass === true || process.env.AGENT_UNSAFE_BYPASS === '1',
+  envAllowlist: Array.isArray(PROJECT.envAllowlist)
+    ? PROJECT.envAllowlist.map(String).map(x => x.trim()).filter(Boolean)
+    : [],
+  sensitivePaths: (() => {
+    const v = PROJECT.sensitivePaths ?? ['.env', '.env.local', '.env.production', '.env.staging']
+    return Array.isArray(v) ? v.map(String).map(x => x.trim()).filter(Boolean) : []
+  })(),
 
   // Subscription account: the constraint is window headroom, not dollars.
   // Never START a session with less headroom than this — a cold start that
@@ -244,9 +274,8 @@ const CONFIG = {
   // The alternative designs all required inventing a transport; this one is a
   // flag on a process that already exists.
   //
-  // Off by default: registering a session with `--dangerously-skip-permissions`
-  // for remote reach is a real decision, and it should be made deliberately in
-  // .harness.json rather than inherited by anyone who clones this.
+  // Off by default: remote reach is a real exposure decision, and it should be
+  // made deliberately in .harness.json rather than inherited by a clone.
   remoteControl: PROJECT.remoteControl === true || process.env.REMOTE_CONTROL === '1',
   // The name the session registers under. Functional, not decorative: it is
   // how you tell one project's orchestrator from another's in the session list.
@@ -323,23 +352,27 @@ const CONFIG = {
 
 // Every path in the system, derived once.
 const STATE = path.join(REPO, '.harness')
+// Preserve the original Claude filenames for backward compatibility. Other
+// providers get their own session and metering state so switching models never
+// destroys the thread address or inherits another provider's cooldown.
+const PROVIDER_STATE_SUFFIX = CONFIG.provider === 'claude' ? '' : `.${CONFIG.provider}`
 const P = {
   state: STATE,
   runs: path.join(STATE, 'runs'),        // stream-json transcript per tick
   events: path.join(STATE, 'events'),    // hook events, keyed by session id
   inbox: path.join(STATE, 'inbox.md'),
-  cooldown: path.join(STATE, 'cooldown_until'),
+  cooldown: path.join(STATE, `cooldown_until${PROVIDER_STATE_SUFFIX}`),
   lock: path.join(STATE, 'run.lock'),
   paused: path.join(STATE, 'paused'),
   stopped: path.join(STATE, 'stopped'),
-  probe: path.join(STATE, 'last_probe'),
+  probe: path.join(STATE, `last_probe${PROVIDER_STATE_SUFFIX}`),
   budgetBaseline: path.join(STATE, 'budget_baseline'),
   // Consecutive sessions that committed nothing but bookkeeping. Reset to 0 by
   // the first session that ships anything. Drives the idle backoff.
   idleStreak: path.join(STATE, 'idle_streak'),
   // The durable orchestrator conversation. Survives ticks, survives the harness
   // process dying, and is what `harness chat` attaches to.
-  orchestrator: path.join(STATE, 'orchestrator_session'),
+  orchestrator: path.join(STATE, `orchestrator_session${PROVIDER_STATE_SUFFIX}`),
   // Held while a human is attached via `harness chat`. Two processes writing one
   // session transcript would corrupt it, so the tick refuses to run behind it.
   attached: path.join(STATE, 'attached'),
@@ -363,7 +396,7 @@ const P = {
   // refresh guarantee (measured 87 minutes stale, still quoting a monthly limit
   // that had been raised hours earlier). Persisting what the stream already
   // told us is the difference between metering and guessing.
-  usage: path.join(STATE, 'usage.jsonl'),
+  usage: path.join(STATE, `usage${PROVIDER_STATE_SUFFIX}.jsonl`),
   runLog: path.join(STATE, 'run.log'),
   stderr: path.join(STATE, 'stderr.log'),
   launchdOut: path.join(STATE, 'launchd.out.log'),
@@ -391,6 +424,7 @@ function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d }
 const nowSec = () => Math.floor(Date.now() / 1000)
 const exists = p => { try { fs.accessSync(p); return true } catch { return false } }
 const readInt = p => { try { return parseInt(fs.readFileSync(p, 'utf8').trim(), 10) || 0 } catch { return 0 } }
+const sensitiveWorkspacePaths = () => CONFIG.sensitivePaths.filter(rel => exists(path.resolve(REPO, rel)))
 
 // HEAD at a moment in time, or null when git cannot answer (not a repo, no
 // commits yet). Null is handled everywhere as "cannot tell", never as "no
@@ -416,22 +450,16 @@ function gitChangedPaths(from, to) {
 
 // ── the orchestrator conversation ─────────────────────────────────────────
 //
-// A session id is only usable if its transcript still exists — Claude Code
-// stores one .jsonl per session under a directory named for the cwd. Resuming
-// an id whose transcript has been deleted fails the whole tick, so an id that
-// cannot be proven live is discarded and a new session started instead.
-function transcriptPath(sid) {
-  const dir = REPO.replace(/[/.]/g, '-')
-  return path.join(os.homedir(), '.claude', 'projects', dir, `${sid}.jsonl`)
-}
-
+// A session id is only usable if the configured provider can prove it still
+// exists. Resuming a deleted id fails the whole tick, so an unprovable id is
+// discarded and a new session started instead.
 function readOrchestrator() {
   let sid
   try { sid = fs.readFileSync(P.orchestrator, 'utf8').trim() } catch { return null }
   if (!/^[0-9a-f-]{36}$/i.test(sid)) return null
-  // Not finding the transcript is normal after a `claude` data reset, and must
+  // Not finding provider state after a local data reset is normal, and must
   // degrade to "start a fresh session", never to a failed tick.
-  return exists(transcriptPath(sid)) ? sid : null
+  return providerSessionExists(CONFIG.provider, sid, REPO) ? sid : null
 }
 const writeOrchestrator = sid => { ensureDirs(); fs.writeFileSync(P.orchestrator, sid) }
 
@@ -500,7 +528,14 @@ function logLine(msg) {
   fs.appendFileSync(P.runLog, `${ts} ${msg}\n`)
 }
 function childEnv() {
-  return { ...process.env, PATH: [...CONFIG.extraPath, process.env.PATH || ''].join(':') }
+  // Never hand the agent the supervisor's complete environment. API keys and
+  // CI tokens are commonly exported in a parent shell; inherited wholesale,
+  // they are readable by every command the model launches. Authentication is
+  // expected to come from the provider CLI's signed-in/keychain state.
+  return sanitizedEnv(process.env, {
+    allowlist: CONFIG.envAllowlist,
+    extraPath: CONFIG.extraPath,
+  })
 }
 
 // ───────────────────────────────────────────────────── observed live usage
@@ -620,6 +655,15 @@ function canBuyThrough(usage, paidSoFar) {
 // Reads Claude Code's own cached subscription utilisation, overlaid with any
 // live reading that is newer. Returns { ok, fivePct, sevenPct, resumeAt, reason }.
 function checkUsage(opts = {}) {
+  // Codex does not expose Claude's subscription-window feed. "Unavailable" is
+  // represented explicitly and clears only this provider-specific gate; the
+  // unit, context, breaker and git gates still apply.
+  if (!PROVIDER.accountUsage) {
+    return {
+      ok: true, available: false, fivePct: null, sevenPct: null,
+      readingAt: 0, source: 'unavailable', reason: `${CONFIG.provider} exposes no account-window meter`,
+    }
+  }
   const now = opts.now ?? nowSec()
   let util, fetchedAtMs = 0
   try {
@@ -797,6 +841,12 @@ function checkUsage(opts = {}) {
 // ───────────────────────────────────────────────────────────────── tick
 async function cmdTick() {
   ensureDirs()
+  const exposed = sensitiveWorkspacePaths()
+  if (exposed.length) {
+    logLine(`SECURITY STOP — sensitive workspace path(s) present: ${exposed.join(', ')}. Values were not read.`)
+    logLine('Move runtime secrets outside the development workspace before running an autonomous provider.')
+    return
+  }
   if (exists(P.stopped)) { logLine('stop marker present — unloading launchd'); cmdStop(); return }
   if (exists(P.paused)) { logLine('paused — skipping'); return }
   // Never run a tick into a session a human is typing into. Both processes
@@ -872,7 +922,11 @@ async function cmdTick() {
     logLine(`${usage.reason} (5h ${usage.fivePct}%) — until ${new Date(usage.resumeAt * 1000).toLocaleTimeString()}`)
     return
   }
-  logLine(`usage OK (5h ${usage.fivePct}%, 7d ${usage.sevenPct}%) floor ${CONFIG.usageFloorPct}%`)
+  if (PROVIDER.accountUsage) {
+    logLine(`usage OK (5h ${usage.fivePct}%, 7d ${usage.sevenPct}%) floor ${CONFIG.usageFloorPct}%`)
+  } else {
+    logLine(`${CONFIG.provider} account-window usage unavailable — unit/context/breaker limits remain active`)
+  }
 
   // yyyymmddhhmmss — 14 chars. slice(0,15) kept the fractional-seconds dot and
   // produced "…143051..jsonl".
@@ -881,7 +935,8 @@ async function cmdTick() {
   // Resume the orchestrator if there is one, otherwise open a new conversation.
   // `--resume` reuses the id, so `sessionId` is right either way.
   const resuming = CONFIG.persistentSession ? readOrchestrator() : null
-  const sessionId = resuming || randomUUID()
+  let sessionId = resuming || (PROVIDER.callerChoosesSessionId ? randomUUID() : null)
+  const freshSession = !resuming
 
   // A resumed orchestrator already HAS the brief in its context. Re-sending it
   // every tick would re-pay for it and, worse, read as a fresh instruction to
@@ -952,7 +1007,7 @@ ${APPROVALS_BRIEF}`
   // balance does not refill the way the usage window does, so this stop is
   // final until Adi raises the cap.
   const bud = budgetState()
-  if (bud.exhausted) {
+  if (PROVIDER.costUsd && bud.exhausted) {
     logLine(`BUDGET CAP REACHED — $${bud.since.toFixed(2)} of $${bud.cap} allowance spent. `
       + `Not starting. Raise BUDGET_CAP or re-baseline with \`harness budget reset\`.`)
     return
@@ -962,7 +1017,7 @@ ${APPROVALS_BRIEF}`
   // covered for free after a wait. Refuse to start a session that can only run
   // on credits, unless that trade was explicitly bought with ALLOW_OVERAGE=1.
   const cr = creditState()
-  if (cr.known && cr.enabled) {
+  if (PROVIDER.accountUsage && cr.known && cr.enabled) {
     if (cr.limitReached) {
       logLine(`account spend limit reached (${cr.fmt(cr.usedMinor)} of ${cr.fmt(cr.limitMinor)}) — not starting`)
       return
@@ -978,60 +1033,33 @@ ${APPROVALS_BRIEF}`
   const dropped = dropStaleSupervisorLines()
   if (dropped) logLine(`dropped ${dropped} stale supervisor nudge(s) from a prior session`)
 
-  fs.writeFileSync(P.currentSession, sessionId)
+  if (sessionId) fs.writeFileSync(P.currentSession, sessionId)
   logLine(resuming
     ? `resuming orchestrator ${sessionId} — max ${CONFIG.maxUnits} unit(s)`
-    : `starting tick — new session ${sessionId}, max ${CONFIG.maxUnits} unit(s)`)
-  if (CONFIG.persistentSession && !resuming) writeOrchestrator(sessionId)
+    : `starting tick — new ${CONFIG.provider} session ${sessionId || '(id assigned by provider)'}, max ${CONFIG.maxUnits} unit(s)`)
+  if (CONFIG.persistentSession && !resuming && sessionId) writeOrchestrator(sessionId)
 
-  const args = [
-    '-p', prompt,
-    // `--session-id` NAMES a new session; `--resume` continues an existing one.
-    // Passing both is rejected, so this is either/or.
-    ...(resuming ? ['--resume', sessionId] : ['--session-id', sessionId]),
-    '--dangerously-skip-permissions',
-    '--model', CONFIG.model,
-    '--fallback-model', CONFIG.fallbackModel,
-    '--output-format', 'stream-json', '--verbose',
-    // Build sessions inherit Adi's ACCOUNT-LEVEL claude.ai connectors — Shopify,
-    // Supermetrics, Zendrop, Gmail, Drive, Indeed — and each dumps an instruction
-    // block and a deferred tool list into turn one. None relates to this repo. On
-    // 2026-08-03 that pushed sessions to the context ceiling at START-UP, before
-    // orientation and before a single file was read: three consecutive ticks
-    // landed at 91-92% of the session allowance having done nothing.
-    //
-    // It cannot be fixed from the repo — `~/.claude.json` carries no `mcpServers`
-    // globally or per-project and there is no `.mcp.json`; the connectors arrive
-    // with the account. With no `--mcp-config` alongside it, this flag resolves to
-    // "use no MCP servers at all", which is what an unattended single-repo build
-    // wants. Requires Claude Code >= 2.1.220.
-    '--strict-mcp-config',
-    // Without this the stream carries subagent tool calls but not their text
-    // or thinking, so the dashboard can show that renderer-smith is running
-    // but not what it is doing. Requires Claude Code >= 2.1.211.
-    '--forward-subagent-text',
-    // Lifecycle events (PreToolUse, PostToolUse, Stop, Notification, ...) on
-    // the SAME stdout stream we already parse.
-    //
-    // The alternative — the pattern the observable-agent harnesses use — is a
-    // hook shim: point every hook at a tiny script that forwards its payload
-    // over a Unix socket to one resident process. That buys a control channel,
-    // because Claude Code reads the hook's JSON REPLY. We do not want the
-    // control channel: replying `{"decision":"block"}` on Stop is forced
-    // continuation, and that spends credits while a human is mid-answer.
-    //
-    // For the OBSERVE direction, which is all we want, this flag is the whole
-    // feature: no socket, no shim script, no second process, and nothing at
-    // the edge that can stall a turn by failing.
-    ...(CONFIG.hookEvents ? ['--include-hook-events'] : []),
-  ]
+  const queued = PROVIDER.hookInbox ? '' : queuedPromptMessages()
+  const runPrompt = queued ? `${prompt}\n\nQUEUED HUMAN/SUPERVISOR MESSAGES:\n${queued}` : prompt
+  const invocation = headlessInvocation({
+    provider: CONFIG.provider, repo: REPO, prompt: runPrompt,
+    sessionId, fresh: freshSession, model: CONFIG.model,
+    fallbackModel: CONFIG.fallbackModel, sandbox: CONFIG.sandbox,
+    permissionMode: CONFIG.permissionMode, unsafeBypass: CONFIG.unsafeBypass,
+    hookEvents: CONFIG.hookEvents,
+  })
 
   const sink = fs.createWriteStream(runLogPath, { flags: 'a' })
   const errSink = fs.createWriteStream(P.stderr, { flags: 'a' })
   // Stamped BEFORE the spawn so the comparison afterwards is against this run
   // and not against whatever the tree looked like when the harness booted.
   const headBefore = gitHead()
-  const child = spawn('claude', args, { cwd: REPO, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+  const startedAt = Date.now()
+  const child = spawn(invocation.command, invocation.args, { cwd: REPO, env: childEnv(), stdio: ['ignore', 'pipe', 'pipe'] })
+  if (queued) child.once('spawn', () => fs.rmSync(P.inbox, { force: true }))
+  child.on('error', err => {
+    try { errSink.write(`${new Date().toISOString()} provider spawn failed: ${err.message}\n`) } catch {}
+  })
   child.stderr.pipe(errSink)
 
 
@@ -1136,7 +1164,15 @@ ${APPROVALS_BRIEF}`
     const lines = buf.split('\n'); buf = lines.pop() ?? ''
     for (const ln of lines) {
       if (!ln.trim()) continue
-      let ev; try { ev = JSON.parse(ln) } catch { continue }
+      let raw; try { raw = JSON.parse(ln) } catch { continue }
+      for (const ev of normalizeProviderEvent(CONFIG.provider, raw)) {
+      if (ev.type === 'provider_session' && ev.session_id) {
+        sessionId = ev.session_id
+        fs.writeFileSync(P.currentSession, sessionId)
+        if (CONFIG.persistentSession) writeOrchestrator(sessionId)
+        logLine(`${CONFIG.provider} assigned orchestrator ${sessionId}`)
+        continue
+      }
 
       if (ev.type === 'result') result = ev
       else if (ev.type === 'system' && ev.subtype === 'api_retry') {
@@ -1214,6 +1250,7 @@ ${APPROVALS_BRIEF}`
       // Not an else-branch: the meter needs the `result` event, which is
       // matched further up.
       tokenMeter.feed(ev)
+      }
     }
   })
 
@@ -1225,10 +1262,11 @@ ${APPROVALS_BRIEF}`
 
   const rec = {
     ts: new Date().toISOString(),
-    session_id: sessionId,
-    cost_usd: result?.total_cost_usd ?? 0,
+    session_id: sessionId || `unknown-${stamp}`,
+    provider: CONFIG.provider,
+    cost_usd: PROVIDER.costUsd ? (result?.total_cost_usd ?? 0) : null,
     turns: result?.num_turns ?? 0,
-    duration_ms: result?.duration_ms ?? 0,
+    duration_ms: result?.duration_ms ?? (Date.now() - startedAt),
     exit: code,
     subtype: result?.subtype ?? 'none',
     rate_limit_events: rateLimited,
@@ -1270,7 +1308,7 @@ ${APPROVALS_BRIEF}`
 
   if (code === 0) {
     const t = rec.tokens
-    logLine(`tick ok — $${rec.cost_usd.toFixed(4)}, ${rec.turns} turns, `
+    logLine(`tick ok — ${rec.cost_usd === null ? 'cost unavailable' : `$${rec.cost_usd.toFixed(4)}`}, ${rec.turns} turns, `
       + `${retries} retries, peak ctx ${Math.round(peakCtx / 1000)}k`)
     logLine(`  tokens ${t.measured ? `${t.output} out, cache hit ${Math.round(t.cache_hit * 100)}%` : 'not measured (no result event)'}`
       + `, ${t.subagents} subagent(s), ${usageWrites} usage reading(s)`)
@@ -1338,7 +1376,7 @@ ${APPROVALS_BRIEF}`
       how = 'cached estimate'
     }
     writeCooldown(resume, 'window_reset')
-    logLine(`tick hit the usage window ($${rec.cost_usd.toFixed(4)}, ${rec.turns} turns, `
+    logLine(`tick hit the usage window (${rec.cost_usd === null ? 'cost unavailable' : `$${rec.cost_usd.toFixed(4)}`}, ${rec.turns} turns, `
       + `peak ctx ${Math.round(peakCtx / 1000)}k) — ${how}, resuming `
       + `${new Date(resume * 1000).toLocaleTimeString()}`)
   } else if (killedByBreaker) {
@@ -1771,9 +1809,11 @@ function budgetState() {
 async function cmdSprint() {
   const started = Date.now()
   let pass = 0
-  logLine(`SPRINT start — overage ${CONFIG.allowOverage ? `ALLOWED to est $${CONFIG.creditCapUsd}` : 'refused'}`)
-  console.log(`sprint — ctrl-C to stop. Guards: budget $${CONFIG.budgetCapUsd}, `
-    + `credits ${CONFIG.allowOverage ? '$' + CONFIG.creditCapUsd : 'refused'}, ctx `
+  const financial = PROVIDER.costUsd
+    ? `budget $${CONFIG.budgetCapUsd}, credits ${CONFIG.allowOverage ? '$' + CONFIG.creditCapUsd : 'refused'}, `
+    : 'provider cost/account telemetry unavailable, '
+  logLine(`SPRINT start — provider ${CONFIG.provider}; ${financial}`)
+  console.log(`sprint — ctrl-C to stop. Guards: ${financial}ctx `
     + `${Math.round(CONFIG.maxCtxHandoffTokens / 1000)}k, ${CONFIG.maxUnits} units/session`)
 
   for (;;) {
@@ -1784,9 +1824,9 @@ async function cmdSprint() {
       break
     }
     const bud = budgetState()
-    if (bud.exhausted) { console.log(`sprint — budget cap $${bud.cap} reached, ending`); break }
+    if (PROVIDER.costUsd && bud.exhausted) { console.log(`sprint — budget cap $${bud.cap} reached, ending`); break }
     const paid = paidCreditSpendUsd()
-    if (CONFIG.allowOverage && paid >= CONFIG.creditCapUsd) {
+    if (PROVIDER.accountUsage && CONFIG.allowOverage && paid >= CONFIG.creditCapUsd) {
       console.log(`sprint — credit cap est $${paid.toFixed(2)}/$${CONFIG.creditCapUsd} reached, ending`)
       break
     }
@@ -1809,8 +1849,9 @@ async function cmdSprint() {
     const t0 = Date.now()
     await cmdTick()
     const secs = ((Date.now() - t0) / 1000).toFixed(0)
-    console.log(`sprint — pass ${pass} done in ${secs}s · est paid $${paidCreditSpendUsd().toFixed(2)} `
-      + `· budget $${budgetState().since.toFixed(2)}/$${CONFIG.budgetCapUsd}`)
+    console.log(PROVIDER.costUsd
+      ? `sprint — pass ${pass} done in ${secs}s · est paid $${paidCreditSpendUsd().toFixed(2)} · budget $${budgetState().since.toFixed(2)}/$${CONFIG.budgetCapUsd}`
+      : `sprint — pass ${pass} done in ${secs}s · provider cost unavailable`)
 
     // A tick that returns in under a second did no work — it was gated. Backing
     // off avoids a hot loop that spins on the same refusal hundreds of times.
@@ -1821,7 +1862,8 @@ async function cmdSprint() {
     await new Promise(r => setTimeout(r, 5000))
   }
   const mins = ((Date.now() - started) / 6e4).toFixed(0)
-  logLine(`SPRINT end — ${pass} pass(es) over ${mins}m, est paid $${paidCreditSpendUsd().toFixed(2)}`)
+  logLine(`SPRINT end — ${pass} pass(es) over ${mins}m`
+    + (PROVIDER.costUsd ? `, est paid $${paidCreditSpendUsd().toFixed(2)}` : ', provider cost unavailable'))
   console.log(`sprint — ended after ${pass} pass(es), ${mins}m.`)
 }
 
@@ -1869,6 +1911,11 @@ async function cmdChat(argv) {
   let sid = CONFIG.persistentSession ? readOrchestrator() : null
   const fresh = !sid
   if (fresh) {
+    if (!PROVIDER.callerChoosesSessionId) {
+      console.error(`${CONFIG.provider} has no persisted orchestrator yet.`)
+      console.error('Run one manual `harness tick` first; then `harness chat` attaches to that exact thread.')
+      process.exit(1)
+    }
     // Nothing has run yet, or the conversation was rotated. Opening the brief
     // as a new session is the right move: it is the same thing the next tick
     // would have done, and it means `harness chat` works on a cold install.
@@ -1890,7 +1937,7 @@ async function cmdChat(argv) {
     : `attaching to the orchestrator (${sid.slice(0, 8)}) — the same session the scheduler drives`)
   console.log('scheduler is held off while you are attached. Exit to hand it back.')
   const notice = remoteNotice({
-    remoteControl: CONFIG.remoteControl,
+    remoteControl: PROVIDER.remoteControl && CONFIG.remoteControl,
     remoteName: CONFIG.remoteName,
     project: CONFIG.project,
     extra: argv,
@@ -1898,20 +1945,18 @@ async function cmdChat(argv) {
   if (notice) console.log(notice)
   console.log('')
 
-  const args = chatArgs({
-    sessionId: sid,
-    fresh,
+  const invocation = interactiveInvocation({
+    provider: CONFIG.provider, repo: REPO, sessionId: sid, fresh,
     prompt: fresh ? fs.readFileSync(P.prompt, 'utf8') : undefined,
-    model: CONFIG.model,
-    remoteControl: CONFIG.remoteControl,
-    remoteName: CONFIG.remoteName,
-    project: CONFIG.project,
-    extra: argv,
+    model: CONFIG.model, sandbox: CONFIG.sandbox,
+    permissionMode: CONFIG.permissionMode, unsafeBypass: CONFIG.unsafeBypass,
+    remoteControl: PROVIDER.remoteControl && CONFIG.remoteControl,
+    remoteName: CONFIG.remoteName, project: CONFIG.project, extra: argv,
   })
 
   // stdio inherit is the whole trick — the child owns the terminal and renders
-  // the genuine Claude Code interface. Nothing here proxies or reimplements it.
-  const child = spawn('claude', args, { cwd: REPO, env: childEnv(), stdio: 'inherit' })
+  // the genuine provider interface. Nothing here proxies or reimplements it.
+  const child = spawn(invocation.command, invocation.args, { cwd: REPO, env: childEnv(), stdio: 'inherit' })
   const code = await new Promise(res => child.on('close', res))
   release()
   console.log(`\ndetached — scheduler resumes at the next tick (${CONFIG.intervalSec / 60}m).`)
@@ -2005,12 +2050,24 @@ function cmdAnswer(status, argv) {
 
 async function cmdCommit(argv) {
   ensureDirs()
-  const message = argv.join(' ').trim()
-  if (!message) {
-    console.error('usage: harness commit "<message>"')
+  const paths = []
+  let all = false
+  const words = []
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--all') { all = true; continue }
+    if (argv[i] === '--path') {
+      if (!argv[i + 1]) { console.error('--path needs a repo-relative file or directory'); process.exit(1) }
+      paths.push(argv[++i]); continue
+    }
+    if (argv[i] === '--') continue
+    words.push(argv[i])
+  }
+  const message = words.join(' ').trim()
+  if (!message || (!all && paths.length === 0) || (all && paths.length)) {
+    console.error('usage: harness commit (--path <repo-relative-path> ... | --all) -- "<message>"')
     process.exit(1)
   }
-  const r = await realCommitter().commit(message)
+  const r = await realCommitter().commit(message, { paths, all })
   if (r.ok && r.kind === 'clean') { console.log('nothing to commit — tree already clean'); return }
   if (r.ok) { console.log(`committed (attempt ${r.attempts})`); return }
   console.error(`commit failed after ${r.attempts} attempt(s): ${r.kind}`)
@@ -2081,6 +2138,11 @@ function briefGate({ fresh, quiet = false }) {
 }
 
 function cmdBudget(arg) {
+  if (!PROVIDER.costUsd) {
+    console.log(`${CONFIG.provider} does not expose a settled USD cost in its JSONL stream; dollar budget enforcement is unavailable.`)
+    console.log('Unit, context, breaker and idle limits remain active. Use the provider billing UI for account spend.')
+    return
+  }
   ensureDirs()
   const total = spentTotal()
   if (arg === 'reset' || arg === undefined) {
@@ -2099,8 +2161,9 @@ function snapshot() {
   const u = checkUsage()
   return {
     scheduler: schedulerState(),
-    usage: { five: u.fivePct, seven: u.sevenPct, floor: CONFIG.usageFloorPct },
-    todayCost: todayCost(),
+    provider: CONFIG.provider,
+    usage: { available: PROVIDER.accountUsage, five: u.fivePct, seven: u.sevenPct, floor: CONFIG.usageFloorPct },
+    todayCost: PROVIDER.costUsd ? todayCost() : null,
     pending: pendingInbox(),
     sessions: [...sessions.values()].sort((a, b) => (b.label > a.label ? 1 : -1)).slice(0, 25)
       .map(s => ({
@@ -2162,7 +2225,32 @@ async function cmdUi() {
 function say(message, { supervisor = false } = {}) {
   ensureDirs()
   const line = message.trim().replace(/\n/g, ' ')
-  fs.appendFileSync(P.inbox, (supervisor ? SUPERVISOR_PREFIX : '') + line + '\n')
+  const framed = (supervisor ? SUPERVISOR_PREFIX : '') + line
+  if (PROVIDER.liveQueue) {
+    let sid = null
+    try { sid = fs.readFileSync(P.currentSession, 'utf8').trim() || null } catch {}
+    const invocation = queueInvocation({
+      provider: CONFIG.provider, sessionId: sid, message: framed, model: CONFIG.model,
+    })
+    if (invocation) {
+      try {
+        execFileSync(invocation.command, invocation.args, {
+          cwd: REPO, env: childEnv(), stdio: 'pipe', timeout: 10_000,
+        })
+        return
+      } catch {
+        // A turn may be between queueable states. Preserve the message for the
+        // next prompt instead of dropping human steering on a transport detail.
+      }
+    }
+  }
+  fs.appendFileSync(P.inbox, framed + '\n')
+}
+
+function queuedPromptMessages() {
+  try {
+    return fs.readFileSync(P.inbox, 'utf8').split('\n').map(x => x.trim()).filter(Boolean).join('\n')
+  } catch { return '' }
 }
 
 // A context nudge is only meaningful to the session that earned it. If the
@@ -2217,11 +2305,13 @@ function nextTickDecision() {
   // Whether launchd is loaded is a separate fact from what the gate would
   // decide, and reporting it as a short-circuit hides the thing worth seeing.
   const note = schedulerState() === 'unloaded' ? ' [launchd not loaded — harness start]' : ''
+  const exposed = sensitiveWorkspacePaths()
+  if (exposed.length) return `never — sensitive workspace path(s) present: ${exposed.join(', ')}; values not read${note}`
   // A blocker halts the agent at step 1 regardless of what the gate decides, so
   // reporting the gate alone would be a lie: `status` would say RUN while every
   // session started, re-read the blocker and stopped.
   const bud = budgetState()
-  if (bud.exhausted) return `never — budget cap reached ($${bud.since.toFixed(2)} of $${bud.cap})${note}`
+  if (PROVIDER.costUsd && bud.exhausted) return `never — budget cap reached ($${bud.since.toFixed(2)} of $${bud.cap})${note}`
   if (exists(P.blocked)) return `RUNS BUT HALTS — ${path.relative(REPO, P.blocked)} present${note}`
   if (exists(P.stopped)) return `never — stop marker set${note}`
   if (exists(P.paused)) return `never — paused (harness resume)${note}`
@@ -2260,7 +2350,8 @@ const clock = sec => sec ? new Date(sec * 1000).toLocaleTimeString([], { hour: '
 function meterState() {
   const u = checkUsage()
   const now = nowSec()
-  const runs = readCostRecords().filter(r => r.exit === 0 && (r.turns || 0) >= 5)
+  const runs = readCostRecords().filter(r => r.exit === 0
+    && (r.provider ? r.provider === CONFIG.provider : CONFIG.provider === 'claude'))
   const recent = runs.slice(-10)
   const sum = (rs, f) => rs.reduce((a, r) => a + (f(r) || 0), 0)
   // Only runs that produced a settled `result` usage block are counted. A run
@@ -2269,6 +2360,9 @@ function meterState() {
   const tok = recent.map(r => r.tokens).filter(t => t?.measured)
   const billedIn = sum(tok, t => t.input) + sum(tok, t => t.cache_read) + sum(tok, t => t.cache_write)
   return {
+    provider: CONFIG.provider,
+    accountUsageAvailable: PROVIDER.accountUsage,
+    costAvailable: PROVIDER.costUsd,
     u,
     ageSec: u.readingAt ? now - u.readingAt : null,
     runs: runs.length,
@@ -2278,14 +2372,22 @@ function meterState() {
     subagents: sum(tok, t => t.subagents),
     cacheHit: billedIn ? sum(tok, t => t.cache_read) / billedIn : null,
     costPerRun: recent.length ? sum(recent, r => r.cost_usd) / recent.length : 0,
-    paid: paidCreditSpendUsd(),
-    budget: budgetState(),
+    paid: PROVIDER.accountUsage ? paidCreditSpendUsd() : null,
+    budget: PROVIDER.costUsd ? budgetState() : null,
   }
 }
 
 function cmdUsage(argv) {
   const m = meterState()
   if (argv.includes('--json')) { console.log(JSON.stringify(m)); return }
+  if (!PROVIDER.accountUsage) {
+    console.log(`provider    ${CONFIG.provider}`)
+    console.log('account     window utilisation and paid-credit state unavailable from this CLI')
+    console.log(`tokens      ${m.measured ? `${(m.out / 1000).toFixed(0)}k output across ${m.measured} measured run(s)` : 'not yet measured'}`)
+    console.log('limits      maxUnits, context ceiling, breaker and idle backoff are active')
+    console.log('billing     inspect the provider billing UI; the harness will not invent a dollar figure')
+    return
+  }
   const stale = m.ageSec === null ? 'NO READING'
     : m.ageSec > 3600 ? `${ago(m.ageSec)} — STALE, treat as a floor not a fact`
     : ago(m.ageSec)
@@ -2312,6 +2414,11 @@ function cmdUsage(argv) {
  * a preamble that grows is a preamble that costs on every turn.
  */
 function meterPreamble() {
+  if (!PROVIDER.accountUsage) {
+    return `PROVIDER METER: ${CONFIG.provider} does not expose account-window or USD-cost telemetry here.
+Do not infer that unavailable means zero. The unit cap, context ceiling, breaker,
+verification requirements and human-approval boundaries still apply.`
+  }
   const m = meterState()
   const age = m.ageSec === null ? 'no reading' : ago(m.ageSec)
   const free = !m.u.ok ? 'the window is spent'
@@ -2335,12 +2442,22 @@ function cmdStatus() {
   const cd = readCooldown()
   const runs = (() => { try { return fs.readdirSync(P.runs).length } catch { return 0 } })()
   console.log(`scheduler   ${schedulerState()}`)
-  console.log(`usage       5h ${u.fivePct}%  7d ${u.sevenPct}%  (floor ${CONFIG.usageFloorPct}%)`)
+  console.log(`provider    ${CONFIG.provider}`)
+  const exposed = sensitiveWorkspacePaths()
+  console.log(`secrets     ${exposed.length
+    ? `BLOCKED — sensitive workspace path(s): ${exposed.join(', ')} (values not read)`
+    : 'no configured sensitive paths present in workspace'}`)
+  console.log(PROVIDER.accountUsage
+    ? `usage       5h ${u.fivePct}%  7d ${u.sevenPct}%  (floor ${CONFIG.usageFloorPct}%)`
+    : 'usage       account-window telemetry unavailable (not zero)')
   console.log(`cooldown    ${cd.until > nowSec() ? `${new Date(cd.until * 1000).toLocaleTimeString()} (${cd.reason})` : 'none'}`)
   if (CONFIG.persistentSession) {
     const sid = readOrchestrator()
     const who = attachedPid()
-    console.log(`orchestrator ${sid ? `${sid.slice(0, 8)} (harness chat to talk to it)` : 'none yet — first tick or `harness chat` opens one'}`
+    const empty = PROVIDER.callerChoosesSessionId
+      ? 'none yet — first tick or `harness chat` opens one'
+      : 'none yet — one manual `harness tick` creates the provider thread'
+    console.log(`orchestrator ${sid ? `${sid.slice(0, 8)} (harness chat to talk to it)` : empty}`
       + (who ? `  ATTACHED pid ${who}, scheduler held off` : ''))
   }
   const idle = readIdleStreak()
@@ -2349,16 +2466,21 @@ function cmdStatus() {
     console.log(`idle streak ${idle} session(s) shipped nothing — backing off to ${Math.round(wait / 60)}m`
       + (wait >= CONFIG.idleBackoffCapSec ? ' (at cap; the backlog is probably empty)' : ''))
   }
-  console.log(`model       ${CONFIG.model} → ${CONFIG.fallbackModel}, max ${CONFIG.maxUnits} unit(s)/session`)
-  console.log(`today       $${todayCost().toFixed(4)} across ${runs} run(s)`)
-  const bud = budgetState()
-  const pctBudget = Math.round((bud.since / bud.cap) * 100)
-  const flag = bud.exhausted ? '  ← CAP REACHED, will not start'
-    : pctBudget >= 80 ? '  ← approaching cap' : ''
-  console.log(`budget      $${bud.since.toFixed(2)} of $${bud.cap} allowance (${pctBudget}%), `
-    + `$${bud.remaining.toFixed(2)} left${flag}`)
-  console.log(`            lifetime $${bud.total.toFixed(2)}${bud.baseline ? `, baseline $${bud.baseline.toFixed(2)}` : ' (no baseline set)'} (notional API-equivalent, NOT credits)`)
-  const cr = creditState()
+  const modelLine = CONFIG.fallbackModel ? `${CONFIG.model} → ${CONFIG.fallbackModel}` : (CONFIG.model || 'provider default')
+  console.log(`model       ${modelLine}, max ${CONFIG.maxUnits} unit(s)/session`)
+  if (PROVIDER.costUsd) {
+    console.log(`today       $${todayCost().toFixed(4)} across ${runs} run(s)`)
+    const bud = budgetState()
+    const pctBudget = Math.round((bud.since / bud.cap) * 100)
+    const flag = bud.exhausted ? '  ← CAP REACHED, will not start'
+      : pctBudget >= 80 ? '  ← approaching cap' : ''
+    console.log(`budget      $${bud.since.toFixed(2)} of $${bud.cap} allowance (${pctBudget}%), `
+      + `$${bud.remaining.toFixed(2)} left${flag}`)
+    console.log(`            lifetime $${bud.total.toFixed(2)}${bud.baseline ? `, baseline $${bud.baseline.toFixed(2)}` : ' (no baseline set)'} (notional API-equivalent, NOT credits)`)
+  } else {
+    console.log(`cost        unavailable from ${CONFIG.provider}; dollar cap cannot be enforced locally`)
+  }
+  const cr = PROVIDER.accountUsage ? creditState() : { known: false }
   if (cr.known) {
     const mode = CONFIG.allowOverage
       ? `allowed up to est $${CONFIG.creditCapUsd} USD`
@@ -2412,14 +2534,14 @@ switch (cmd) {
   default:
     console.log(`usage: harness <command>
 
-  chat            talk to the orchestrator — the real Claude Code TUI, on the
+  chat            talk to the orchestrator — the provider's real TUI, on the
                   same session the scheduler drives
   tick            run one build session   (launchd calls this)
-  hook            Claude Code hook target (settings.json calls this)
+  hook            Claude Code hook target (Claude settings.json calls this)
   ui              live dashboard on :${CONFIG.uiPort} + message channel
   say <message>   send a message to the running agent
   brief [init]    check the brief has a Goal and a Deliverable (init writes one)
-  commit "<msg>"  the ONLY way to commit — one writer, retry, stale-lock recovery
+  commit --path <file> -- "<msg>"  scoped one-writer commit (--all is explicit)
   approvals       what is waiting on you
   approve <id> [note] | reject <id> [note]
   ask <reason> "<line>"   (agents call this; reasons: destructive|spend|scope|conflict)

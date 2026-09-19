@@ -1,19 +1,19 @@
 {
   "name": "agent-build-harness",
   "version": "1.0.0",
-  "description": "An unattended build harness for Claude Code: schedules sessions, meters what they spend, and stops when it should.",
+  "description": "A governed cross-model development harness for Claude Code and OpenAI Codex.",
   "type": "module",
   "license": "MIT",
   "engines": { "node": ">=22" },
   "bin": { "harness": "src/harness.mjs" },
-  "files": ["src", "examples", "README.md", "LICENSE"],
+  "files": ["src", "examples", "docs", "AGENTS.md", "CLAUDE.md", "README.md", "LICENSE"],
   "scripts": {
     "test": "node test/harness.test.mjs",
     "test:stress": "node test/usage-gate.stress.mjs",
     "test:all": "node test/harness.test.mjs && node test/usage-gate.stress.mjs",
     "harness": "node src/harness.mjs"
   },
-  "keywords": ["claude-code", "agent", "harness", "scheduler", "unattended", "cost-control", "llm"],
+  "keywords": ["claude-code", "codex", "agent", "harness", "scheduler", "unattended", "cost-control", "llm"],
   "dependencies": {},
   "devDependencies": {}
 }

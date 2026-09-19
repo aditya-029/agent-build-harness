@@ -1,16 +1,16 @@
 # agent-build-harness
 
-An unattended build harness for [Claude Code](https://claude.com/claude-code). Point it at a
-git repository, and it wakes on a schedule, runs a build session, watches what the session
-does, meters what it spends, and parks itself with a reason when it should stop.
+An unattended, cross-model build harness for Claude Code and OpenAI Codex. Point it at a git
+repository and it can run a governed development session, preserve handoff context, observe
+what shipped, accept human steering, and park itself with a reason when it should stop.
 
-Zero dependencies. Node ≥ 22 and the `claude` CLI are the whole install.
+Zero runtime dependencies. Node ≥ 22 plus the provider CLI you select are the whole install.
 
 ```
 harness install     # write the launchd job
 harness start       # arm it
-harness chat        # TALK TO IT — the real Claude Code TUI, on the session
-                    # the scheduler is driving. No second session, no relay.
+harness chat        # TALK TO IT — the provider's real TUI, on the session
+                    # the scheduler is driving. No second reasoning agent.
 harness status      # one screen: usage, budget, cooldown, next tick
 ```
 
@@ -39,9 +39,8 @@ to *address*: to steer the build you open a **second** interactive session that 
 logs and relays on your behalf — a translator between you and your own agent.
 
 This one keeps a single orchestrator conversation. Every tick resumes it, so context carries
-over and no tick pays a cold start. And because a headless session writes an ordinary
-transcript to `~/.claude/projects`, the same place an interactive one does, you can simply
-resume it yourself:
+over and no tick pays a cold start. Both supported CLIs persist headless sessions, so the
+harness can resume the same provider thread interactively:
 
 ```
 $ harness chat
@@ -49,9 +48,10 @@ attaching to the orchestrator (1d9f1792) — the same session the scheduler driv
 scheduler is held off while you are attached. Exit to hand it back.
 ```
 
-That is the **real Claude Code TUI**, with its slash commands and its full history, on the
-exact conversation the scheduler has been driving. Nothing here proxies or reimplements the
-interface — `stdio` is inherited and the child owns your terminal.
+That is the provider's **real TUI**, with its own commands and history, on the exact
+conversation the harness has been driving. Nothing here proxies or reimplements the interface.
+Claude can create a fresh session from `harness chat`; Codex assigns thread IDs itself, so one
+manual `harness tick` must create the thread before the first Codex attachment.
 
 The scheduler and the keyboard are mutually exclusive: a tick will not run while you are
 attached, and `chat` refuses to start on top of a running tick. Two writers on one transcript
@@ -84,7 +84,23 @@ Set `"persistentSession": false` to go back to spawn-per-tick.
 | **Re-pins rules after compaction** | a summary is a claim, not evidence; the non-negotiables are re-injected through `PreToolUse`, which actually reaches a running session |
 | **Backs off when idle** | the wait doubles for every session that ships nothing, so an empty backlog stops costing money |
 | **Observes** | a live dashboard with the agent tree, and a message channel — `harness say "..."` reaches the running session |
-| **Talks back** | `harness chat` opens the real Claude Code TUI on the orchestrator's own session — see above |
+| **Talks back** | `harness chat` opens the provider's real TUI on the orchestrator's own session — see above |
+
+### Provider capabilities
+
+The adapter does not pretend the two CLIs expose identical telemetry:
+
+| Capability | Claude Code | Codex CLI |
+|---|---:|---:|
+| Persistent headless session + interactive resume | yes | yes |
+| Live human steer while a run is active | hook inbox | native `codex queue` |
+| Subscription-window and settled USD telemetry | yes | unavailable |
+| Provider-native remote phone control | yes | not exposed here |
+| Default unattended safety | `--permission-mode auto` | `--sandbox workspace-write` |
+
+When telemetry is unavailable, status says **unavailable**, never `$0`. Unit, context,
+verification, breaker, approval, and idle gates still operate. See
+[the cross-model operating model](docs/CROSS-MODEL-OPERATING-MODEL.md).
 
 ## Install
 
@@ -99,6 +115,11 @@ In the repository you want built, create `.harness.json` and a prompt:
 // .harness.json — every key optional, see examples/harness.json for all of them
 {
   "project": "My Project",
+  "provider": "codex",
+  "providers": {
+    "claude": { "model": "sonnet", "fallbackModel": "haiku" },
+    "codex": { "model": null, "sandbox": "workspace-write" }
+  },
   "journalPath": "logs/journal.jsonl",
   "budgetCapUsd": 40,
   "compactRules": [
@@ -110,14 +131,14 @@ In the repository you want built, create `.harness.json` and a prompt:
 
 ```bash
 echo "You are the PM for this repo. Read CLAUDE.md ..." > .harness-prompt.md
-harness budget 40      # stamp the spend baseline the cap counts from
+harness budget reset   # Claude only: stamp the spend baseline
 harness install && harness start
 ```
 
 The harness finds its target from `$HARNESS_REPO`, else the git root of `$PWD`. It never
 writes to its own checkout — all state lives in `<target>/.harness/`.
 
-### Wire up the hook (optional but recommended)
+### Wire up the Claude hook (Claude only; optional but recommended)
 
 Without it, the harness sees only the run's final result — no live cost, no context
 watching, no message delivery. In the target repo's `.claude/settings.json`:
@@ -229,8 +250,8 @@ drives. No bespoke UI, no auth layer, nothing listening on a non-loopback port.
 { "remoteControl": true, "remoteName": "JARVIS" }
 ```
 
-Off by default. Registering a session that runs with `--dangerously-skip-permissions` for
-remote reach is a decision worth making deliberately, not one to inherit by cloning.
+Off by default. The harness no longer enables `--dangerously-skip-permissions` by default;
+an unsafe bypass requires the explicit `unsafeBypass` project setting.
 
 ## The brief
 
@@ -277,13 +298,17 @@ worst — an orphaned lock from a killed process that blocks **every** future co
 So agents write plain files and never run git. One process commits:
 
 ```bash
-harness commit "feat: the thing"
+harness commit --path src/thing.mjs --path test/thing.test.mjs -- "feat: the thing"
 ```
 
 Serialised, with retry and growing backoff, and **age-based stale-lock recovery** — a lock
 untouched for ten seconds belongs to a dead process and is cleared before the attempt rather
 than after the failure. A fixed identity with `commit.gpgsign=false`, so an unattended
 committer can never hang on a signing prompt.
+
+Autonomous workers must declare their paths. Broad `git add -A` is available only through an
+explicit human-controlled `--all`, so one agent cannot silently sweep another agent's or the
+operator's unrelated working-tree changes into its commit.
 
 ## Approvals
 
@@ -308,7 +333,7 @@ answering at once cannot clobber each other.
 ## Tests
 
 ```bash
-npm test          # 351 assertions
+npm test
 npm run test:stress
 ```
 
@@ -340,11 +365,14 @@ failure modes appearing, and fail loudly if one is swallowed into the wrong plac
 
 - **macOS only** for scheduling. `launchctl` is load-bearing; the rest is portable, and a
   systemd unit or a cron line calling `harness tick` would work on Linux.
-- **Requires Claude Code ≥ 2.1.220** for `--strict-mcp-config`, and ≥ 2.1.211 for
-  `--forward-subagent-text`.
-- **Subscription-shaped.** The gating logic assumes a plan with a rolling allowance plus
-  optional paid credits. On pure pay-as-you-go, `budgetCapUsd` is the only limit that means
-  anything.
+- **Claude-specific metering requires Claude Code ≥ 2.1.220** for `--strict-mcp-config`, and
+  ≥ 2.1.211 for `--forward-subagent-text`. Codex does not expose equivalent account-window or
+  USD-cost events through `codex exec --json`, so the harness reports those controls as
+  unavailable for Codex.
+- **Provider auth must use CLI sign-in/keychain state.** The harness deliberately strips
+  secret-shaped environment variables before spawning an agent. It never forwards the parent
+  shell's API keys or CI tokens. A tick also refuses to start while a configured sensitive path
+  such as `.env` exists inside the development workspace; it reports only the path, never values.
 - **Not a substitute for supervision.** It is a good way to run the *build* of a project
   unattended. It should never be the thing that performs an outward-facing, irreversible
   action — sending, publishing, purchasing, submitting. Those want a human at the gate, and

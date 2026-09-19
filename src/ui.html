@@ -77,8 +77,12 @@ function render() {
   const sc = document.getElementById('sched')
   sc.textContent = state.scheduler; sc.className = 'pill ' + state.scheduler
   const u = state.usage || {}
-  document.getElementById('usage').textContent = `5h ${u.five ?? 0}% · 7d ${u.seven ?? 0}% (floor ${u.floor ?? 0}%)`
-  document.getElementById('cost').textContent = '$' + (state.todayCost || 0).toFixed(3) + ' today'
+  document.getElementById('usage').textContent = u.available === false
+    ? `${state.provider || 'provider'} account usage unavailable`
+    : `5h ${u.five ?? 0}% · 7d ${u.seven ?? 0}% (floor ${u.floor ?? 0}%)`
+  document.getElementById('cost').textContent = state.todayCost === null
+    ? 'cost unavailable'
+    : '$' + (state.todayCost || 0).toFixed(3) + ' today'
   document.getElementById('pend').textContent =
     state.pending?.length ? 'queued, delivers on the agent’s next tool call: ' + state.pending.join('  ·  ') : ''
 
@@ -90,7 +94,7 @@ function render() {
 
   const s = state.sessions.find(x => x.id === sel) || state.sessions[0]
   const tree = document.getElementById('tree')
-  if (!s) { tree.innerHTML = '<div class="hint">No sessions yet. Arm the scheduler, or open an interactive Claude session in this repo &mdash; hooks capture both.</div>'; return }
+  if (!s) { tree.innerHTML = '<div class="hint">No sessions yet. Arm the scheduler, or attach through the configured provider in this repo.</div>'; return }
   sel = s.id
   tree.innerHTML = s.nodes.map(n => `
     <div class="node${n.id === 'main' ? '' : ' sub'}">

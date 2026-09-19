@@ -1,14 +1,19 @@
-name: ci
+name: CI
+
 on:
-  push: { branches: [main] }
+  push:
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: '22' }
-      # No install step: the harness has zero dependencies, by design.
-      - run: node test/harness.test.mjs
-      - run: node test/usage-gate.stress.mjs
+        with:
+          node-version: 22
+      # No install step: the harness has zero runtime and development dependencies.
+      - run: npm run test:all

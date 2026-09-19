@@ -3,6 +3,14 @@
 
   "project": "My Project",
   "label": "com.harness.my-project",
+  "provider": "claude",
+  "providers": {
+    "claude": { "model": "sonnet", "fallbackModel": "haiku", "permissionMode": "auto" },
+    "codex": { "model": null, "sandbox": "workspace-write" }
+  },
+  "unsafeBypass": false,
+  "envAllowlist": [],
+  "sensitivePaths": [".env", ".env.local", ".env.production", ".env.staging"],
 
   "journalPath": "logs/journal.jsonl",
   "blockedPath": "logs/blocked.md",

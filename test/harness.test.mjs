@@ -31,10 +31,15 @@ import {
 import { createBreaker, breakerMessage, BREAKER_DEFAULTS } from '../src/breaker.mjs'
 import { parseMemory, trimMemory, memoryBrief, MEMORY_TEMPLATE } from '../src/memory.mjs'
 import { chatArgs, hasFlag, remoteNotice } from '../src/chat.mjs'
+import {
+  providerCapabilities, headlessInvocation, interactiveInvocation,
+  queueInvocation, normalizeProviderEvent,
+} from '../src/providers.mjs'
 import { parseBrief, validateBrief, briefPreamble, BRIEF_TEMPLATE } from '../src/brief.mjs'
 import { createVerifier, verifierMessage, findClaims, isEvidence, VERIFY_CHECKLIST } from '../src/verify.mjs'
-import { createCommitter, classifyGitError, isStaleLock, backoffMs, commitArgs, STALE_LOCK_MS } from '../src/committer.mjs'
+import { createCommitter, classifyGitError, isStaleLock, backoffMs, commitArgs, stageArgs, STALE_LOCK_MS } from '../src/committer.mjs'
 import { makeRequest, parseQueue, currentState, pending, answer, relayMessage, renderQueue, REASONS, APPROVALS_BRIEF } from '../src/approvals.mjs'
+import { sanitizedEnv } from '../src/environment.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
@@ -85,6 +90,15 @@ const ok = (name, cond, detail = '') => {
 const run = (args, input) => {
   try {
     return { out: execFileSync('node', [H, ...args], { input: input ?? '', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }), code: 0 }
+  } catch (e) { return { out: e.stdout || '', err: e.stderr || '', code: e.status } }
+}
+const runWithEnv = (args, extraEnv = {}) => {
+  try {
+    return {
+      out: execFileSync('node', [H, ...args], {
+        encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...extraEnv },
+      }), code: 0,
+    }
   } catch (e) { return { out: e.stdout || '', err: e.stderr || '', code: e.status } }
 }
 const hook = p => run(['hook'], typeof p === 'string' ? p : JSON.stringify(p))
@@ -138,6 +152,29 @@ console.log('\n── CLI regression')
   ok('usage renders a human report', /reading\s+\S/.test(run(['usage']).out) && /5-hour\s+\d+%/.test(run(['usage']).out))
   ok('unknown command exits 1', run(['nonsense']).code === 1)
   ok('no command exits 0', run([]).code === 0)
+  const codexStatus = runWithEnv(['status'], { AGENT_PROVIDER: 'codex' })
+  ok('Codex status boots without starting a session', codexStatus.code === 0)
+  ok('Codex status reports missing account telemetry honestly',
+    /provider\s+codex/.test(codexStatus.out) && /telemetry unavailable \(not zero\)/.test(codexStatus.out))
+  ok('Codex status does not invent a dollar cost', /cost\s+unavailable from codex/.test(codexStatus.out))
+  ok('Codex status never displays Claude account-credit telemetry', !/credits\s/.test(codexStatus.out))
+}
+
+console.log('\n── Sensitive workspace gate')
+{
+  const envFile = path.join(SANDBOX, '.env')
+  const sentinel = 'DO-NOT-PRINT-THIS-VALUE'
+  fs.writeFileSync(envFile, `API_KEY=${sentinel}\n`, { mode: 0o600 })
+  const status = run(['status'])
+  ok('status blocks while a configured secret file is in the workspace',
+    /secrets\s+BLOCKED/.test(status.out) && /next tick\s+never/.test(status.out))
+  ok('the secret gate reports only a path, never a value',
+    status.out.includes('.env') && !status.out.includes(sentinel))
+  const beforeRuns = (() => { try { return fs.readdirSync(path.join(STATE, 'runs')).length } catch { return 0 } })()
+  run(['tick'])
+  const afterRuns = (() => { try { return fs.readdirSync(path.join(STATE, 'runs')).length } catch { return 0 } })()
+  ok('a blocked tick never starts a provider run', afterRuns === beforeRuns)
+  fs.rmSync(envFile, { force: true })
 }
 
 console.log('\n── pause / resume')
@@ -555,10 +592,12 @@ console.log('\n── Overage message does not tell an authorised run to stop')
   // message told the agent to wind down the instant it began drawing credits —
   // which is precisely the spend that was bought to keep it working.
   const src = fs.readFileSync(path.join(SRC, 'harness.mjs'), 'utf8')
-  const allowed = src.slice(src.indexOf('if (CONFIG.allowOverage) {'), src.indexOf('} else {'))
+  const overageStart = src.indexOf('if (CONFIG.allowOverage) {')
+  const overageElse = src.indexOf('} else {', overageStart)
+  const allowed = src.slice(overageStart, overageElse)
   ok('authorised overage does not instruct a stop', !/finish the current unit and stop/.test(allowed))
   ok('authorised overage explicitly says keep working', /Do NOT wind down early/.test(allowed))
-  const refused = src.slice(src.indexOf('} else {', src.indexOf('if (CONFIG.allowOverage) {')))
+  const refused = src.slice(overageElse)
   ok('UNauthorised overage still demands an immediate stop', /STOP NOW/.test(refused.slice(0, 900)))
 }
 
@@ -1184,11 +1223,14 @@ console.log('\n── Chat argv and Remote Control')
     (() => { try { chatArgs({ ...base, sessionId: '', fresh: false }); return false } catch { return true } })())
 
   ok('the TUI flags are present on both shapes',
-    ['--model', '--dangerously-skip-permissions', '--strict-mcp-config'].every(f =>
+    ['--model', '--permission-mode', '--strict-mcp-config'].every(f =>
       fresh.includes(f) && resumed.includes(f)))
+  ok('dangerous permission bypass is off by default',
+    !fresh.includes('--dangerously-skip-permissions') && !resumed.includes('--dangerously-skip-permissions'))
+  ok('dangerous permission bypass requires an explicit opt-in',
+    chatArgs({ ...base, fresh: false, unsafeBypass: true }).includes('--dangerously-skip-permissions'))
 
-  // Remote control is OFF unless asked for. A session running with
-  // --dangerously-skip-permissions must not become remotely reachable by default.
+  // Remote control is OFF unless asked for.
   ok('remote control is off by default',
     !resumed.includes('--remote-control'))
 
@@ -1234,6 +1276,65 @@ console.log('\n── Chat argv and Remote Control')
     remoteNotice({ remoteControl: false, project: 'demo' }) === null)
   ok('there is no attach notice when the operator passed the flag themselves',
     remoteNotice({ remoteControl: true, project: 'demo', extra: ['--remote-control', 'MINE'] }) === null)
+}
+
+console.log('\n── Cross-provider adapter')
+{
+  ok('Claude and Codex capabilities are explicit rather than guessed',
+    providerCapabilities('claude').accountUsage && !providerCapabilities('codex').accountUsage)
+
+  const codexFresh = headlessInvocation({
+    provider: 'codex', repo: '/tmp/repo', prompt: 'BUILD', fresh: true,
+  })
+  ok('a fresh Codex run is JSONL and workspace-scoped',
+    codexFresh.command === 'codex' && codexFresh.args.includes('--json')
+      && codexFresh.args.includes('workspace-write') && codexFresh.args.includes('/tmp/repo'))
+  ok('Codex is never given a dangerous bypass by the adapter',
+    !codexFresh.args.some(a => a.includes('dangerously')))
+
+  const codexResume = headlessInvocation({
+    provider: 'codex', repo: '/tmp/repo', prompt: 'NEXT', fresh: false, sessionId: 'thread-1',
+  })
+  ok('a Codex continuation uses exec resume on the exact thread',
+    codexResume.args.slice(0, 3).join(' ') === 'exec resume --json'
+      && codexResume.args.includes('thread-1'))
+
+  const queued = queueInvocation({ provider: 'codex', sessionId: 'thread-1', message: 'steer here' })
+  ok('Codex live steering uses its native queue command',
+    queued.args.join(' ').includes('queue --thread thread-1 --message steer here'))
+  ok('Claude steering remains hook-delivered',
+    queueInvocation({ provider: 'claude', sessionId: 's', message: 'x' }) === null)
+
+  ok('Codex chat refuses to invent an attachable id for a fresh thread',
+    (() => {
+      try { interactiveInvocation({ provider: 'codex', repo: '/tmp/repo', fresh: true }) ; return false }
+      catch { return true }
+    })())
+
+  const normalized = normalizeProviderEvent('codex', {
+    type: 'turn.completed', usage: { input_tokens: 120, cached_input_tokens: 80, output_tokens: 20 },
+  })
+  ok('Codex terminal usage feeds the existing context and token meters',
+    normalized.length === 2 && normalized[0].type === 'assistant'
+      && normalized[1].type === 'result' && normalized[1].usage.cache_read_input_tokens === 80
+      && normalized[1].usage.input_tokens === 40)
+  ok('Codex thread ids are captured from structured events',
+    normalizeProviderEvent('codex', { type: 'thread.started', thread_id: 'abc' })[0].session_id === 'abc')
+}
+
+console.log('\n── Provider environment boundary')
+{
+  const source = {
+    HOME: '/safe/home', PATH: '/usr/bin', LANG: 'en_AU.UTF-8',
+    OPENAI_API_KEY: 'must-not-leak', GITHUB_TOKEN: 'must-not-leak', ORDINARY_SETTING: 'ok',
+  }
+  const env = sanitizedEnv(source, { allowlist: ['ORDINARY_SETTING'], extraPath: ['/tool/bin'] })
+  ok('safe operating variables reach the provider', env.HOME === '/safe/home' && env.LANG === 'en_AU.UTF-8')
+  ok('explicit non-secret variables can be allowlisted', env.ORDINARY_SETTING === 'ok')
+  ok('unrequested API keys and tokens never reach the provider',
+    !('OPENAI_API_KEY' in env) && !('GITHUB_TOKEN' in env))
+  ok('even an explicit secret-shaped allowlist entry is refused',
+    (() => { try { sanitizedEnv(source, { allowlist: ['GITHUB_TOKEN'] }); return false } catch { return true } })())
 }
 
 console.log('\n── The brief: four parts, one of them load-bearing')
@@ -1391,6 +1492,13 @@ console.log('\n── Single committer: one writer for git')
   ok('the committer never waits on a GPG prompt', args.includes('commit.gpgsign=false'))
   ok('the committer uses a fixed identity so it cannot block on user.name',
     args.some(a => a.startsWith('user.name=')) && args.some(a => a.startsWith('user.email=')))
+  ok('scoped staging uses the pathspec separator',
+    stageArgs({ paths: ['src/a.mjs', 'test/a.test.mjs'] }).join(' ') === 'add -- src/a.mjs test/a.test.mjs')
+  ok('whole-tree staging requires an explicit all flag', stageArgs({ all: true }).join(' ') === 'add -A')
+  ok('an empty autonomous commit scope is refused',
+    (() => { try { stageArgs(); return false } catch { return true } })())
+  ok('a parent traversal cannot escape the declared repository',
+    (() => { try { stageArgs({ paths: ['../secret'] }); return false } catch { return true } })())
 
   // A fake git that can be made to fail on demand. The point of injecting IO:
   // this ladder is tested against a known git, not whatever the developer's
@@ -1413,7 +1521,7 @@ console.log('\n── Single committer: one writer for git')
 
   {
     const { io, calls } = mkIo([])
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('a normal commit succeeds on the first attempt', r.ok && r.attempts === 1 && r.kind === 'committed')
     ok('it stages before committing', calls[0] === 'add -A')
   }
@@ -1423,7 +1531,7 @@ console.log('\n── Single committer: one writer for git')
       { status: 0, stdout: '', stderr: '' },
       { status: 1, stdout: 'nothing to commit, working tree clean', stderr: '' },
     ])
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('an already-clean tree returns ok WITHOUT retrying',
       r.ok && r.kind === 'clean' && r.attempts === 1)
   }
@@ -1435,7 +1543,7 @@ console.log('\n── Single committer: one writer for git')
       { status: 0 }, { status: 1, stderr: "Unable to create '.git/index.lock': File exists." },
       { status: 0 }, { status: 0 },
     ])
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('a lock collision is retried until it clears', r.ok && r.attempts === 3, JSON.stringify(r))
   }
 
@@ -1443,7 +1551,7 @@ console.log('\n── Single committer: one writer for git')
     const script = []
     for (let i = 0; i < 20; i++) script.push({ status: 0 }, { status: 1, stderr: 'index.lock: File exists' })
     const { io } = mkIo(script)
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('a lock that never clears gives up quietly rather than spinning',
       !r.ok && r.kind === 'locked' && r.attempts === 6)
   }
@@ -1455,7 +1563,7 @@ console.log('\n── Single committer: one writer for git')
     const now = 1_000_000
     const { io, removed } = mkIo([{ status: 0 }, { status: 0 }],
       { lockMtime: now - STALE_LOCK_MS - 1, now })
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('a stale lock is cleared before the attempt, not after the failure',
       r.ok && removed.length === 1)
   }
@@ -1463,14 +1571,14 @@ console.log('\n── Single committer: one writer for git')
   {
     const now = 1_000_000
     const { io, removed } = mkIo([{ status: 0 }, { status: 0 }], { lockMtime: now - 500, now })
-    await createCommitter(io).commit('m')
+    await createCommitter(io).commit('m', { all: true })
     ok('a FRESH lock is never deleted — that would corrupt a live write',
       removed.length === 0)
   }
 
   {
     const { io } = mkIo([{ status: 0 }, { status: 128, stderr: 'fatal: not a git repository' }])
-    const r = await createCommitter(io).commit('m')
+    const r = await createCommitter(io).commit('m', { all: true })
     ok('a non-lock failure is reported at once, not retried six times',
       !r.ok && r.kind === 'error' && r.attempts === 1)
   }
@@ -1484,7 +1592,7 @@ console.log('\n── Single committer: one writer for git')
       lockMtime: () => null, removeLock() {}, now: () => 1, sleep: async () => {},
     }
     const c = createCommitter(io)
-    await Promise.all([c.commit('a'), c.commit('b')])
+    await Promise.all([c.commit('a', { all: true }), c.commit('b', { all: true })])
     ok('concurrent commits are serialised, never interleaved',
       order.join(',') === 'add,commit,add,commit', order.join(','))
   }
@@ -1498,8 +1606,8 @@ console.log('\n── Single committer: one writer for git')
       lockMtime: () => null, removeLock() {}, now: () => 1, sleep: async () => {},
     }
     const c = createCommitter(io)
-    await c.commit('a').catch(() => {})
-    const second = await c.commit('b')
+    await c.commit('a', { all: true }).catch(() => {})
+    const second = await c.commit('b', { all: true })
     ok('a thrown error does not wedge the queue for every later commit', second.ok)
   }
 }

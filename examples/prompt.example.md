@@ -23,7 +23,8 @@ a meaningful slice of the session on not-building.
    disposable and yours is not.
 3. Run the verify command. Quote its real output. Never claim green without it.
 4. If a reviewer agent is configured, show it the actual `git diff` before committing.
-5. Commit.
+5. Commit only the files you own with `harness commit --path <file> [--path <file>...] -- "<message>"`.
+   Never use `--all` from an autonomous worker; it exists for a human-controlled recovery.
 6. Append one line to <journalPath>: what shipped, and a precise "next".
 7. Stop when you hit the unit cap, the context ceiling, or the usage warning.
 
