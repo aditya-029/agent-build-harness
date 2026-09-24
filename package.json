@@ -4,16 +4,41 @@
   "description": "A governed cross-model development harness for Claude Code and OpenAI Codex.",
   "type": "module",
   "license": "MIT",
-  "engines": { "node": ">=22" },
-  "bin": { "harness": "src/harness.mjs" },
-  "files": ["src", "examples", "docs", "AGENTS.md", "CLAUDE.md", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "harness": "src/harness.mjs"
+  },
+  "files": [
+    "src",
+    "examples",
+    "docs",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node test/harness.test.mjs",
     "test:stress": "node test/usage-gate.stress.mjs",
-    "test:all": "node test/harness.test.mjs && node test/usage-gate.stress.mjs",
-    "harness": "node src/harness.mjs"
+    "test:all": "node test/harness.test.mjs && node test/usage-gate.stress.mjs && node test/ecc-ingest.test.mjs && node test/v2.test.mjs",
+    "harness": "node src/harness.mjs",
+    "test:ecc": "node test/ecc-ingest.test.mjs",
+    "ecc": "node src/ecc-ingest.mjs",
+    "test:v2": "node test/v2.test.mjs",
+    "mcp": "node src/harness.mjs mcp"
   },
-  "keywords": ["claude-code", "codex", "agent", "harness", "scheduler", "unattended", "cost-control", "llm"],
+  "keywords": [
+    "claude-code",
+    "codex",
+    "agent",
+    "harness",
+    "scheduler",
+    "unattended",
+    "cost-control",
+    "llm"
+  ],
   "dependencies": {},
   "devDependencies": {}
 }

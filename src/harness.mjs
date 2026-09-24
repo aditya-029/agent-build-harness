@@ -44,7 +44,7 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn, execFile, execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import {
@@ -59,12 +59,18 @@ import { remoteNotice } from './chat.mjs'
 import {
   providerCapabilities, providerSessionExists, headlessInvocation,
   interactiveInvocation, queueInvocation, normalizeProviderEvent,
+  codexWindowReading, codexOperatorServers, PROVIDER_NAMES,
 } from './providers.mjs'
 import { validateBrief, BRIEF_TEMPLATE, briefPreamble } from './brief.mjs'
 import { createVerifier, verifierMessage, VERIFY_CHECKLIST } from './verify.mjs'
 import { createCommitter } from './committer.mjs'
 import { makeRequest, parseQueue, pending, answer, relayMessage, renderQueue, currentState, REASONS, APPROVALS_BRIEF } from './approvals.mjs'
 import { sanitizedEnv } from './environment.mjs'
+import { validateQueue, effectiveStatus, blockedReason, unitBrief } from './units.mjs'
+import { decideNext, recordOutcome, outcomeEvent } from './runner.mjs'
+import { createNotifier, createSender, tierOf, loadChannels, NOTIFY_CONFIG } from './notify.mjs'
+import { serveStdio } from './mcp.mjs'
+import { mirrorScan, parseDenylist } from './mirror.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 
@@ -97,6 +103,15 @@ const PROJECT = loadProjectConfig(REPO)
 // A project value wins over the default; an env var wins over both, so a
 // one-off `MAX_UNITS=2 harness tick` still works without editing the file.
 const pick = (key, envVal, dflt) => envVal ?? PROJECT[key] ?? dflt
+// `harness attach` must open the provider the runner is actually using for the
+// unit in flight, or the operator lands in an empty Claude thread while Codex
+// holds the work. Only when the operator did not name a provider.
+if (['chat', 'attach'].includes(process.argv[2]) && !process.env.AGENT_PROVIDER) {
+  try {
+    const cur = JSON.parse(fs.readFileSync(path.join(REPO, '.harness', 'runner.json'), 'utf8'))?.current
+    if (cur?.provider) process.env.AGENT_PROVIDER = cur.provider
+  } catch { /* no runner state */ }
+}
 const PROVIDER_NAME = String(pick('provider', process.env.AGENT_PROVIDER, 'claude')).toLowerCase()
 let PROVIDER
 try { PROVIDER = providerCapabilities(PROVIDER_NAME) } catch (e) {
@@ -341,12 +356,26 @@ const CONFIG = {
 
   uiPort: num(pick('uiPort', process.env.PORT, 4317)),
 
+  // The approved unit queue (units.mjs). Repo-relative. The runner builds only
+  // what is in it, and refuses a unit with no runnable acceptance command.
+  unitsPath: pick('unitsPath', process.env.HARNESS_UNITS, '.harness-units.json'),
+  // Public mirrors: { "<prefix>": { "remote": "<url>", "branch": "main" } }.
+  mirrors: PROJECT.mirrors && typeof PROJECT.mirrors === 'object' ? PROJECT.mirrors : {},
+  // Private personal-data denylist for the mirror leak gate. Lives OUTSIDE any
+  // mirrored prefix, so the list itself is never published.
+  leakDenylistPath: pick('leakDenylistPath', process.env.HARNESS_LEAK_DENYLIST, '.leakgate-deny'),
+
   // launchd gives its agents a minimal PATH; none of node/npm/claude/git
   // resolve without this. One list, used wherever a child is spawned.
   extraPath: [
+    // Test seam only: fake provider CLIs ahead of the real ones.
+    ...(process.env.HARNESS_PROVIDER_BIN ? [process.env.HARNESS_PROVIDER_BIN] : []),
     path.dirname(process.execPath),
     path.join(os.homedir(), '.local/bin'),
     '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+    // The Codex CLI ships inside the ChatGPT desktop app on macOS and is not
+    // put on PATH. Last, so a separately installed `codex` wins.
+    ...(process.platform === 'darwin' ? ['/Applications/ChatGPT.app/Contents/Resources'] : []),
   ],
 }
 
@@ -418,6 +447,17 @@ const P = {
   ui: path.join(HERE, 'ui.html'),
   plist: path.join(os.homedir(), 'Library/LaunchAgents', `${CONFIG.label}.plist`),
   claudeConfig: path.join(os.homedir(), '.claude.json'),
+  // ── v2: runner, attach handshake, notifications ─────────────────────────
+  units: path.resolve(REPO, CONFIG.unitsPath),
+  runner: path.join(STATE, 'runner.json'),
+  runnerLock: path.join(STATE, 'runner.lock'),
+  // Written by `harness attach` while a session is in flight: the session is
+  // asked to land, and the runner starts nothing new until the human has come
+  // and gone.
+  attachRequest: path.join(STATE, 'attach_request'),
+  unitBrief: path.join(STATE, 'unit-brief.md'),
+  notifications: path.join(STATE, 'notifications.jsonl'),
+  leakDenylist: path.resolve(REPO, CONFIG.leakDenylistPath),
 }
 
 function num(v, d) { const n = Number(v); return Number.isFinite(n) ? n : d }
@@ -532,10 +572,24 @@ function childEnv() {
   // CI tokens are commonly exported in a parent shell; inherited wholesale,
   // they are readable by every command the model launches. Authentication is
   // expected to come from the provider CLI's signed-in/keychain state.
-  return sanitizedEnv(process.env, {
-    allowlist: CONFIG.envAllowlist,
-    extraPath: CONFIG.extraPath,
-  })
+  return {
+    ...sanitizedEnv(process.env, {
+      allowlist: CONFIG.envAllowlist,
+      extraPath: CONFIG.extraPath,
+    }),
+    // Marks every process a build session launches. The human-only commands
+    // (approve, reject, resume, units approve, mirror) refuse under it, so an
+    // agent cannot answer its own approval request through the CLI or the
+    // control tower.
+    HARNESS_AGENT_SESSION: '1',
+  }
+}
+const inAgentSession = () => process.env.HARNESS_AGENT_SESSION === '1'
+function humanOnly(what) {
+  if (!inAgentSession()) return
+  console.error(`${what} is reserved for the operator; a harness-launched build session cannot do it.`)
+  console.error('Queue it with `harness ask <reason> "<line>"` and carry on with other work.')
+  process.exit(1)
 }
 
 // ───────────────────────────────────────────────────── observed live usage
@@ -659,10 +713,14 @@ function checkUsage(opts = {}) {
   // represented explicitly and clears only this provider-specific gate; the
   // unit, context, breaker and git gates still apply.
   if (!PROVIDER.accountUsage) {
-    return {
-      ok: true, available: false, fivePct: null, sevenPct: null,
-      readingAt: 0, source: 'unavailable', reason: `${CONFIG.provider} exposes no account-window meter`,
+    const r = CONFIG.provider === 'codex' ? codexWindowReading() : null
+    if (!r) {
+      return {
+        ok: true, available: false, fivePct: null, sevenPct: null,
+        readingAt: 0, source: 'unavailable', reason: `${CONFIG.provider} exposes no account-window meter`,
+      }
     }
+    return windowVerdict(r, opts.now ?? nowSec())
   }
   const now = opts.now ?? nowSec()
   let util, fetchedAtMs = 0
@@ -834,6 +892,34 @@ function checkUsage(opts = {}) {
   return {
     ok: false, fivePct, sevenPct, ...meta, authoritative: true, resumeAt,
     over: { five: overFive, seven: overSeven },
+    reason: 'window headroom below floor',
+  }
+}
+
+/**
+ * Gate verdict from a provider's own window reading (Codex rollouts). Simpler
+ * than Claude's path because the reading is the provider's own record, not a
+ * cache of unknown age — but the same two rules hold: a window whose reset has
+ * passed has rolled over, and a reading with no reset time is not trusted to
+ * park anything.
+ */
+function windowVerdict(r, now) {
+  const live = w => (w && !(w.resetsAt && w.resetsAt <= now)) ? w : null
+  const five = live(r.five), seven = live(r.seven)
+  const fivePct = five?.pct ?? 0, sevenPct = seven?.pct ?? 0
+  const base = {
+    available: true, fivePct, sevenPct, readingAt: r.at, source: 'rollout',
+    fiveResetsAt: five?.resetsAt || 0, sevenResetsAt: seven?.resetsAt || 0,
+  }
+  const tripped = [
+    fivePct >= CONFIG.usageFloorPct ? five : null,
+    sevenPct >= CONFIG.sevenDayFloorPct ? seven : null,
+  ].filter(w => w?.resetsAt)
+  if (!tripped.length) return { ok: true, ...base }
+  return {
+    ok: false, ...base, authoritative: true,
+    over: { five: fivePct >= CONFIG.usageFloorPct, seven: sevenPct >= CONFIG.sevenDayFloorPct },
+    resumeAt: Math.max(...tripped.map(w => w.resetsAt)),
     reason: 'window headroom below floor',
   }
 }
@@ -1047,6 +1133,7 @@ ${APPROVALS_BRIEF}`
     fallbackModel: CONFIG.fallbackModel, sandbox: CONFIG.sandbox,
     permissionMode: CONFIG.permissionMode, unsafeBypass: CONFIG.unsafeBypass,
     hookEvents: CONFIG.hookEvents,
+    disabledMcpServers: CONFIG.provider === 'codex' ? codexOperatorServers() : [],
   })
 
   const sink = fs.createWriteStream(runLogPath, { flags: 'a' })
@@ -1887,7 +1974,7 @@ async function cmdSprint() {
 // transcript would interleave the conversation into nonsense, so cmdTick
 // refuses to start while the attach marker names a live PID, and this releases
 // the marker on every exit path including a signal.
-async function cmdChat(argv) {
+async function cmdChat(argv, { takeOver = false } = {}) {
   ensureDirs()
 
   const held = attachedPid()
@@ -1897,15 +1984,30 @@ async function cmdChat(argv) {
     process.exit(1)
   }
 
-  const running = readInt(P.lock)
+  // A session is in flight. Two writers on one transcript would corrupt it, so
+  // attaching is a handshake (F7): ask the session to land, hold the runner so
+  // nothing new starts, and take the keyboard the moment the tick exits. The
+  // operator waits seconds to minutes instead of being told to come back later.
+  const running = livePid(P.lock)
+  if (running && !takeOver) {
+    console.error(`a tick is running right now (pid ${running}).`)
+    console.error('`harness attach` takes over: it asks the session to land and waits for it.')
+    console.error('Or `harness say "..."` to queue a message into it without stopping it.')
+    process.exit(1)
+  }
   if (running) {
-    try {
-      process.kill(running, 0)
-      console.error(`a tick is running right now (pid ${running}).`)
-      console.error('Wait for it, or `harness say "..."` to queue a message into it,')
-      console.error('or `harness pause` then retry once it lands.')
-      process.exit(1)
-    } catch { /* stale lock, carry on */ }
+    fs.writeFileSync(P.attachRequest, String(process.pid))
+    const cancel = () => { try { if (readInt(P.attachRequest) === process.pid) fs.rmSync(P.attachRequest, { force: true }) } catch {} }
+    process.on('exit', cancel)
+    say('A HUMAN IS ATTACHING to this session. Land now: finish only the edit in hand, run '
+      + 'verify, commit if green, write the journal line with a precise "next", and end the '
+      + 'session. Do not start anything new — the operator takes over from here.', { supervisor: true })
+    logLine(`ATTACH requested by pid ${process.pid} — asked tick ${running} to land`)
+    console.log(`a session is running (pid ${running}) — asked it to land; the runner will start nothing new.`)
+    console.log('waiting for it to finish… (ctrl-C cancels the attach and hands back to autonomy)')
+    process.on('SIGINT', () => { cancel(); console.log('\nattach cancelled'); process.exit(130) })
+    while (livePid(P.lock)) await new Promise(r => setTimeout(r, 2000))
+    console.log('session landed.')
   }
 
   let sid = CONFIG.persistentSession ? readOrchestrator() : null
@@ -1926,7 +2028,10 @@ async function cmdChat(argv) {
   if (!briefGate({ fresh })) process.exit(1)
 
   fs.writeFileSync(P.attached, String(process.pid))
-  const release = () => { try { fs.rmSync(P.attached, { force: true }) } catch {} }
+  const release = () => {
+    try { fs.rmSync(P.attached, { force: true }) } catch {}
+    try { if (readInt(P.attachRequest) === process.pid) fs.rmSync(P.attachRequest, { force: true }) } catch {}
+  }
   process.on('exit', release)
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     process.on(sig, () => { release(); process.exit(0) })
@@ -1959,7 +2064,10 @@ async function cmdChat(argv) {
   const child = spawn(invocation.command, invocation.args, { cwd: REPO, env: childEnv(), stdio: 'inherit' })
   const code = await new Promise(res => child.on('close', res))
   release()
-  console.log(`\ndetached — scheduler resumes at the next tick (${CONFIG.intervalSec / 60}m).`)
+  logLine(`DETACH pid ${process.pid}`)
+  console.log(livePid(P.runnerLock)
+    ? '\ndetached — the runner resumes now.'
+    : `\ndetached — scheduler resumes at the next tick (${CONFIG.intervalSec / 60}m).`)
   process.exit(code ?? 0)
 }
 
@@ -2020,6 +2128,7 @@ function cmdAsk(argv) {
   const rec = makeRequest({ id, reason, summary, session: sid, ts: new Date().toISOString() })
   appendApproval(rec)
   logLine(`APPROVAL REQUESTED ${id} [${reason}] ${summary}`)
+  notifyNow('approval', `approval ${id} (${reason})`, summary)
   console.log(`${id} queued — a human must answer before this proceeds.`)
   console.log('Do NOT wait on it. Continue with other work, or stop cleanly.')
 }
@@ -2508,29 +2617,514 @@ function cmdStatus() {
   console.log(`next tick   ${nextTickDecision()}`)
 }
 
+
+// ════════════════════════════════════════════════════════════ harness v2
+//
+// F4 unit queue · F5 event-driven runner · F6 control tower · F7 attach
+// handshake · F8 tiered notifications · F3 public mirrors. Decisions live in
+// units.mjs / runner.mjs / notify.mjs / mcp.mjs / mirror.mjs; this section only
+// gathers facts and performs what those return.
+
+function loadQueue() {
+  let raw
+  try { raw = fs.readFileSync(P.units, 'utf8') } catch {
+    return { ok: false, problems: [`no unit queue at ${path.relative(REPO, P.units)}`], units: [] }
+  }
+  let doc
+  try { doc = JSON.parse(raw) } catch (e) {
+    return { ok: false, problems: [`${path.relative(REPO, P.units)} is not valid JSON — ${e.message}`], units: [] }
+  }
+  return validateQueue(doc)
+}
+function readRunner() {
+  try { return JSON.parse(fs.readFileSync(P.runner, 'utf8')) } catch { return { units: {}, current: null } }
+}
+function writeRunner(state) {
+  ensureDirs()
+  const tmp = `${P.runner}.${process.pid}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2))
+  fs.renameSync(tmp, P.runner)
+}
+const livePid = file => {
+  const pid = readInt(file)
+  if (!pid) return 0
+  try { process.kill(pid, 0); return pid } catch { fs.rmSync(file, { force: true }); return 0 }
+}
+const suffixFor = name => name === 'claude' ? '' : `.${name}`
+const cooldownFileFor = name => path.join(STATE, `cooldown_until${suffixFor(name)}`)
+const orchestratorFileFor = name => path.join(STATE, `orchestrator_session${suffixFor(name)}`)
+function readCooldownFile(f) {
+  try {
+    const raw = fs.readFileSync(f, 'utf8').trim()
+    return raw.startsWith('{') ? JSON.parse(raw) : { until: parseInt(raw, 10) || 0, reason: 'legacy' }
+  } catch { return { until: 0, reason: null } }
+}
+// Test seam: a directory searched before everything else, so the suite can
+// put fake provider CLIs ahead of the real ones.
+const binDirs = () => [process.env.HARNESS_PROVIDER_BIN, ...CONFIG.extraPath, ...(process.env.PATH || '').split(':')].filter(Boolean)
+function providerInstalled(name) {
+  return binDirs().some(d => { try { fs.accessSync(path.join(d, name), fs.constants.X_OK); return true } catch { return false } })
+}
+function appendNotification(rec) {
+  try { ensureDirs(); fs.appendFileSync(P.notifications, JSON.stringify(rec) + '\n') } catch {}
+}
+function makeNotifier() {
+  const off = process.env.HARNESS_NOTIFY === 'off'
+  const real = off ? () => {} : createSender({ project: CONFIG.project, onError: e => logLine(`notify ${e}`), env: childEnv() })
+  return createNotifier({
+    now: nowSec,
+    quietSec: num(process.env.HARNESS_NOTIFY_QUIET, 60),
+    maxWaitSec: num(process.env.HARNESS_NOTIFY_MAXWAIT, 300),
+    send: msg => { appendNotification({ type: 'send', at: nowSec(), ...msg, delivered: !off }); real(msg) },
+    log: e => appendNotification({ type: 'event', ...e }),
+  })
+}
+/** One-shot immediate notification from a short-lived command (ask, blocked). */
+function notifyNow(kind, title, body = '') {
+  const n = makeNotifier()
+  n.event({ kind, title, body })
+}
+
+// ── F4: harness units ──────────────────────────────────────────────────────
+function cmdUnits(argv) {
+  const [sub, id] = argv
+  const q = loadQueue()
+  if (sub === 'check') {
+    if (q.ok) { console.log(`${path.relative(REPO, P.units)} — ${q.units.length} unit(s), all valid`); return }
+    for (const pr of q.problems) console.error(`  ✗ ${pr}`)
+    process.exit(1)
+  }
+  if (sub === 'approve' || sub === 'retry') {
+    humanOnly(`harness units ${sub}`)
+    const unit = q.units.find(u => u.id === id)
+    if (!unit) { console.error(`no unit "${id}"`); process.exit(1) }
+    const rt = readRunner()
+    const cur = rt.units?.[id] || { attempts: 0 }
+    const next = sub === 'approve' ? { ...cur, approved: true } : { ...cur, status: undefined, attempts: 0 }
+    writeRunner({ ...rt, units: { ...(rt.units || {}), [id]: next } })
+    fs.writeFileSync(path.join(STATE, 'wake'), String(nowSec()))
+    logLine(`UNIT ${sub.toUpperCase()} ${id}`)
+    console.log(sub === 'approve' ? `${id} released — the runner may start it` : `${id} reset — attempts cleared`)
+    return
+  }
+  if (!q.ok) {
+    console.log(`unit queue INVALID — the runner will not start anything:`)
+    for (const pr of q.problems) console.log(`  ✗ ${pr}`)
+    process.exit(1)
+  }
+  const rt = readRunner()
+  if (argv.includes('--json')) {
+    console.log(JSON.stringify(q.units.map(u => ({
+      id: u.id, title: u.title, owner: u.owner, status: effectiveStatus(u, rt),
+      waiting: blockedReason(u, q.units, rt), attempts: rt.units?.[u.id]?.attempts ?? 0,
+    })))); return
+  }
+  const icon = { done: '✅', queued: '⏳', adi: '🧑', failed: '❌', dropped: '—' }
+  for (const u of q.units) {
+    const st = effectiveStatus(u, rt)
+    const why = st === 'queued' || st === 'adi' ? blockedReason(u, q.units, rt) : null
+    const tries = rt.units?.[u.id]?.attempts ? ` [${rt.units[u.id].attempts} attempt(s)]` : ''
+    console.log(`${icon[st] || '?'} ${u.id.padEnd(4)} ${u.owner.padEnd(5)} ${u.title.slice(0, 70)}${tries}${why ? `  — ${why}` : ''}`)
+  }
+}
+
+// ── F5: provider gate + the runner ────────────────────────────────────────
+// The same gates cmdTick applies, answered without side effects, as JSON, for
+// THIS process's provider. The runner asks each provider in its own process
+// (AGENT_PROVIDER differs), so every provider is judged by the real code path.
+function gateState() {
+  const installed = providerInstalled(PROVIDER.command || CONFIG.provider)
+  const cd = readCooldown()
+  const u = checkUsage()
+  const bud = budgetState()
+  const out = {
+    provider: CONFIG.provider, installed, available: u.available !== false,
+    fivePct: u.fivePct, sevenPct: u.sevenPct, source: u.source ?? null,
+  }
+  if (!installed) return { ...out, ok: false, reason: `${CONFIG.provider} CLI not found` }
+  if (cooldownHolds(cd)) return { ...out, ok: false, resumeAt: cd.until, reason: `cooldown (${cd.reason})` }
+  if (PROVIDER.costUsd && bud.exhausted) return { ...out, ok: false, reason: 'budget cap reached' }
+  if (!u.ok && !canBuyThrough(u)) return { ...out, ok: false, resumeAt: u.resumeAt, reason: u.reason }
+  return { ...out, ok: true, reason: u.available === false ? `${CONFIG.provider} meter unavailable — not zero, just unknown` : 'headroom' }
+}
+function cmdGate() { console.log(JSON.stringify(gateState())) }
+
+function gateFor(name) {
+  try {
+    const out = execFileSync(process.execPath, [path.join(HERE, 'harness.mjs'), 'gate'], {
+      cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 20_000,
+      env: { ...process.env, HARNESS_REPO: REPO, AGENT_PROVIDER: name },
+    })
+    return JSON.parse(out.trim().split('\n').pop())
+  } catch (e) {
+    return { provider: name, installed: false, ok: false, reason: `gate failed: ${String(e.message).slice(0, 120)}` }
+  }
+}
+
+/** Resolve on a control-relevant change, or at `until` (unix s), whichever is first. */
+function waitForChange({ until = nowSec() + 6 * 3600, maxSec = 6 * 3600 } = {}) {
+  const WATCHED = new Set(['paused', 'stopped', 'attached', 'attach_request', 'approvals.jsonl',
+    'cooldown_until', 'cooldown_until.codex', 'wake', path.basename(P.units), path.basename(P.blocked)])
+  return new Promise(resolve => {
+    const watchers = []
+    let done = false
+    const finish = why => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      for (const w of watchers) { try { w.close() } catch {} }
+      resolve(why)
+    }
+    const ms = Math.max(1000, Math.min((until - nowSec()) * 1000, maxSec * 1000))
+    const timer = setTimeout(() => finish('timer'), ms)
+    for (const dir of new Set([STATE, path.dirname(P.units), path.dirname(P.blocked)])) {
+      try {
+        watchers.push(fs.watch(dir, (_ev, name) => {
+          if (!name || !WATCHED.has(String(name))) return
+          // runner.json is NOT watched: the runner writes it every pass, and a
+          // watcher woken by its own write is a hot loop. Operator edits to
+          // runtime state (units approve/retry) touch `wake` instead.
+          setTimeout(() => finish(`change:${name}`), 250)
+        }))
+      } catch { /* directory missing: the timer still bounds the wait */ }
+    }
+  })
+}
+
+function runAcceptance(unit) {
+  const cwd = path.resolve(REPO, unit.acceptance.cwd)
+  try {
+    const out = execFileSync('bash', ['-c', unit.acceptance.command], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: unit.acceptance.timeoutSec * 1000, maxBuffer: 64 << 20,
+      env: { ...childEnv(), HARNESS_AGENT_SESSION: '' },
+    })
+    return { passed: true, output: out }
+  } catch (e) {
+    return { passed: false, output: `${e.stdout || ''}${e.stderr || ''}${e.signal ? `\n(killed by ${e.signal})` : ''}` || String(e.message) }
+  }
+}
+
+const costCount = () => { try { return fs.readFileSync(P.cost, 'utf8').split('\n').filter(Boolean).length } catch { return 0 } }
+const lastLogLine = () => { try { return fs.readFileSync(P.runLog, 'utf8').trim().split('\n').pop().slice(20) } catch { return '' } }
+
+async function runUnit(d, notifier) {
+  const { unit, provider } = d
+  const rt = readRunner()
+  const prev = rt.units?.[unit.id] || { attempts: 0 }
+  const attempt = prev.attempts + 1
+  ensureDirs()
+  fs.writeFileSync(P.unitBrief, unitBrief(unit, { attempt, lastFailure: prev.lastFailure }))
+  // One unit = one session (assembly line). Resuming is only for a unit that
+  // a spent window interrupted on this same provider.
+  if (!d.resume) fs.rmSync(orchestratorFileFor(provider), { force: true })
+  writeRunner({ ...rt, current: { unit: unit.id, provider, startedAt: nowSec() } })
+  logLine(`RUNNER ${unit.id} → ${provider} (attempt ${attempt}${d.resume ? ', resuming its session' : ''}`
+    + `${d.metered ? '' : `, ${provider} meter unavailable`})`)
+
+  const before = costCount()
+  const code = await new Promise(res => {
+    const child = spawn(process.execPath, [path.join(HERE, 'harness.mjs'), 'tick'], {
+      cwd: REPO, stdio: 'inherit',
+      env: { ...process.env, HARNESS_REPO: REPO, AGENT_PROVIDER: provider, HARNESS_PROMPT: P.unitBrief },
+    })
+    child.on('close', res)
+    child.on('error', () => res(1))
+  })
+  const ran = costCount() > before
+  const cdFile = cooldownFileFor(provider)
+  const cd = readCooldownFile(cdFile)
+  // Under the runner an idle backoff is meaningless: the queue says there is
+  // work. It exists for the timer-driven scheduler.
+  if (cd.reason === 'idle') fs.rmSync(cdFile, { force: true })
+  const limited = cd.reason === 'window_reset' && cd.until > nowSec()
+
+  if (!ran) {
+    if (limited) { logLine(`RUNNER ${unit.id}: ${provider} out of window before starting — rerouting`); return }
+    const why = lastLogLine() || `tick exited ${code} without running`
+    logLine(`RUNNER held — ${why}`)
+    notifier.event({ kind: 'blocked', title: 'runner held', body: why.slice(0, 200) })
+    return 'held'
+  }
+
+  const acc = runAcceptance(unit)
+  const next = recordOutcome(readRunner(), {
+    unit, provider, passed: acc.passed, limited: limited && !acc.passed, output: acc.output, now: nowSec(),
+  })
+  writeRunner(next)
+  logLine(`RUNNER ${unit.id} acceptance ${acc.passed ? 'PASS' : `FAIL${limited ? ' (window spent mid-unit — not counted)' : ''}`}`)
+  notifier.event(outcomeEvent(unit, next))
+}
+
+async function cmdRun(argv) {
+  humanOnly('harness run')
+  ensureDirs()
+  const other = livePid(P.runnerLock)
+  if (other && other !== process.pid) { console.error(`a runner is already active (pid ${other})`); process.exit(1) }
+  fs.writeFileSync(P.runnerLock, String(process.pid))
+  const release = () => { try { if (readInt(P.runnerLock) === process.pid) fs.rmSync(P.runnerLock, { force: true }) } catch {} }
+  process.on('exit', release)
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => { notifier.flush(); release(); process.exit(0) })
+
+  // --until-idle: stop instead of waiting when there is nothing to run right
+  // now. For one-shot operator use and for the tests; the daemon waits.
+  const untilIdle = argv.includes('--until-idle')
+  const notifier = makeNotifier()
+  let lastSaid = null
+  const sayOnce = (kind, title, body) => {
+    const key = `${kind}:${title}:${body}`
+    if (key === lastSaid) return
+    lastSaid = key
+    notifier.event({ kind, title, body })
+  }
+  logLine(`RUNNER start (pid ${process.pid})${untilIdle ? ' — until idle' : ''}`)
+  console.log(`runner — event-driven; ctrl-C to stop. Queue: ${path.relative(REPO, P.units)}`)
+
+  for (;;) {
+    notifier.tick()
+    const q = loadQueue()
+    if (!q.ok) {
+      sayOnce('blocked', 'unit queue invalid', q.problems.join('; ').slice(0, 300))
+      if (untilIdle) break
+      await waitForChange(); continue
+    }
+    const runtime = readRunner()
+    const providers = Object.fromEntries(PROVIDER_NAMES.map(n => [n, gateFor(n)]))
+    const control = {
+      stopped: exists(P.stopped), paused: exists(P.paused),
+      attached: attachedPid() > 0, attachRequested: livePid(P.attachRequest) > 0,
+    }
+    const d = decideNext({ units: q.units, runtime, providers, control, now: nowSec() })
+    writeRunner({ ...readRunner(), last: { at: nowSec(), action: d.action, reason: d.reason ?? null, unit: d.unit?.id ?? null, provider: d.provider ?? null } })
+
+    if (d.action === 'stop') { logLine('RUNNER stop marker — exiting'); break }
+    if (d.action === 'run') {
+      lastSaid = null
+      if (await runUnit(d, notifier) === 'held') {
+        // Gated by something outside the queue (blocker file, brief, budget,
+        // sensitive path). Retrying at once would spin; wait for a change.
+        if (untilIdle) break
+        await waitForChange({ until: nowSec() + 1800 })
+      }
+      continue
+    }
+    if (d.action === 'hold') {
+      if (lastSaid !== `hold:${d.reason}`) { logLine(`RUNNER hold — ${d.reason}`); lastSaid = `hold:${d.reason}` }
+      if (untilIdle && !control.attached && !control.attachRequested) break
+      // A crashed attach leaves a dead PID behind; re-check each minute.
+      await waitForChange({ maxSec: control.attached || control.attachRequested ? 60 : 6 * 3600 }); continue
+    }
+    if (d.action === 'park') {
+      const at = new Date(d.until * 1000).toLocaleTimeString()
+      logLine(`RUNNER park until ${at} — ${d.reason}`)
+      sayOnce('parked', `parked until ${at}`, d.reason)
+      if (untilIdle) break
+      await waitForChange({ until: d.until + 30 }); continue
+    }
+    // idle
+    if (!lastSaid?.includes(d.reason)) logLine(`RUNNER idle — ${d.reason}`)
+    sayOnce('blocked', 'nothing to build', d.reason)
+    if (untilIdle) break
+    const due = notifier.dueIn()
+    await waitForChange(due === null ? {} : { until: nowSec() + due + 1 })
+  }
+  notifier.flush()
+  logLine('RUNNER end')
+}
+
+function cmdRunnerStatus() {
+  const pid = livePid(P.runnerLock)
+  const rt = readRunner()
+  console.log(`runner      ${pid ? `active (pid ${pid})` : 'not running — `harness run` starts it'}`)
+  if (rt.current) console.log(`unit        ${rt.current.unit} on ${rt.current.provider}${rt.current.startedAt ? ` since ${new Date(rt.current.startedAt * 1000).toLocaleTimeString()}` : ''}`)
+  if (rt.last) console.log(`last        ${rt.last.action}${rt.last.unit ? ` ${rt.last.unit}` : ''}${rt.last.provider ? ` on ${rt.last.provider}` : ''}${rt.last.reason ? ` — ${rt.last.reason}` : ''}`)
+  if (livePid(P.attachRequest)) console.log('attach      requested — the session is landing so a human can take over')
+}
+
+function cmdHistory(n = 40) {
+  const lines = Number(n) || 40
+  try {
+    console.log(fs.readFileSync(P.runLog, 'utf8').trim().split('\n').slice(-lines).join('\n'))
+  } catch { console.log('(no run log yet)') }
+  const notes = (() => { try { return fs.readFileSync(P.notifications, 'utf8').trim().split('\n').filter(Boolean).slice(-10) } catch { return [] } })()
+    .map(l => { try { return JSON.parse(l) } catch { return null } }).filter(r => r?.type === 'send')
+  if (notes.length) {
+    console.log('\nnotifications:')
+    for (const r of notes) console.log(`  ${new Date(r.at * 1000).toLocaleString()} [${r.tier}] ${r.title}${r.body ? ` — ${r.body}` : ''}`)
+  }
+}
+
+// ── F6: control tower ───────────────────────────────────────────────────────
+async function cmdMcp() {
+  const self = path.join(HERE, 'harness.mjs')
+  const run = argv => new Promise(resolve => {
+    execFile(process.execPath, [self, ...argv], {
+      cwd: REPO, encoding: 'utf8', timeout: 60_000, maxBuffer: 8 << 20,
+      env: { ...process.env, HARNESS_REPO: REPO },
+    }, (err, stdout, stderr) => resolve({ out: `${stdout || ''}${stderr || ''}`, code: err ? (err.code ?? 1) : 0 }))
+  })
+  await serveStdio({ input: process.stdin, output: process.stdout, run, agentSession: inAgentSession() })
+}
+
+// ── F8: notification channels ───────────────────────────────────────────────
+function cmdNotify(argv) {
+  const ch = loadChannels()
+  if (argv[0] === 'test') {
+    notifyNow('approval', 'test notification', 'If you can read this, the channel works.')
+    console.log('sent a test notification (immediate tier)')
+    return
+  }
+  console.log(`config      ${NOTIFY_CONFIG}${exists(NOTIFY_CONFIG) ? '' : ' (absent — Mac only)'}`)
+  console.log(`mac         ${ch.macos ? 'on' : 'off'}`)
+  console.log(`claude app  ${ch.claudeApp ? `on (${ch.claudeApp.model}; held back while you are active at the terminal)` : 'off'}`)
+  console.log(`ntfy        ${ch.ntfy?.topic ? `on (${ch.ntfy.server || 'https://ntfy.sh'})` : 'off'}`)
+  console.log(`telegram    ${ch.telegram?.chatId ? 'on' : 'off'}`)
+  console.log('tiers       approval/failure/blocked/parked → now · unit done → batched · progress → log only')
+}
+
+// ── F3: public mirror with a leak gate ─────────────────────────────────────
+function git(args, opts = {}) {
+  return execFileSync('git', args, { cwd: REPO, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], maxBuffer: 1 << 30, ...opts })
+}
+/** Every blob reachable from `sha`, with the first path it appears under. */
+function historyBlobs(sha) {
+  const pathOf = new Map()
+  for (const ln of git(['rev-list', '--objects', sha]).split('\n')) {
+    const sp = ln.indexOf(' ')
+    if (sp > 0 && !pathOf.has(ln.slice(0, sp))) pathOf.set(ln.slice(0, sp), ln.slice(sp + 1))
+  }
+  const meta = git(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], { input: [...pathOf.keys()].join('\n') + '\n' })
+  const wanted = meta.split('\n').map(l => l.split(' ')).filter(([, type, size]) => type === 'blob' && Number(size) <= (2 << 20)).map(([oid]) => oid)
+  if (!wanted.length) return []
+  const buf = execFileSync('git', ['cat-file', '--batch'], { cwd: REPO, input: wanted.join('\n') + '\n', maxBuffer: 1 << 30 })
+  const blobs = []
+  let i = 0
+  while (i < buf.length) {
+    const nl = buf.indexOf(10, i)
+    if (nl < 0) break
+    const [oid, , size] = buf.subarray(i, nl).toString('utf8').split(' ')
+    const n = Number(size)
+    const body = buf.subarray(nl + 1, nl + 1 + n)
+    i = nl + 1 + n + 1
+    blobs.push({ path: pathOf.get(oid) || oid, text: body.includes(0) ? null : body.toString('utf8') })
+  }
+  return blobs
+}
+
+function cmdMirror(argv) {
+  const flags = {}
+  const pos = []
+  for (let i = 0; i < argv.length; i++) {
+    if (['--dry-run', '--force', '--snapshot'].includes(argv[i])) flags[argv[i].slice(2)] = true
+    else if (argv[i].startsWith('--')) flags[argv[i].slice(2)] = argv[++i]
+    else pos.push(argv[i])
+  }
+  const prefix = String(pos[0] || '').replace(/\/+$/, '')
+  if (!prefix) {
+    console.error('usage: harness mirror <prefix> [--remote <url>] [--branch main] [--snapshot] [--dry-run] [--force]')
+    const known = Object.keys(CONFIG.mirrors)
+    if (known.length) console.error(`configured: ${known.join(', ')}`)
+    process.exit(1)
+  }
+  // A dry run only reads; agents may use it to check their own work. Pushing
+  // publishes, and publishing is the operator's call.
+  if (!flags['dry-run']) humanOnly('harness mirror (push)')
+  const cfg = CONFIG.mirrors[prefix] || {}
+  const remote = flags.remote || cfg.remote
+  const branch = flags.branch || cfg.branch || 'main'
+  if (!flags['dry-run'] && !remote) { console.error(`no remote for ${prefix} — pass --remote or add it to .harness.json "mirrors"`); process.exit(1) }
+
+  let sha
+  try { sha = git(['subtree', 'split', `--prefix=${prefix}`, 'HEAD']).trim().split('\n').pop() } catch (e) {
+    console.error(`subtree split failed: ${(e.stderr || e.message).toString().trim().split('\n').pop()}`); process.exit(1)
+  }
+  // Snapshot mode publishes the folder's CURRENT tree as one commit on top of
+  // whatever the public branch already holds. Nothing public is rewritten, so
+  // it suits a public repo whose history predates the monorepo. The gate then
+  // scans exactly what is new: the tree, not the monorepo's private history.
+  const snapshot = flags.snapshot || cfg.mode === 'snapshot'
+  const tree = git(['rev-parse', `${sha}^{tree}`]).trim()
+  const scanRef = snapshot ? git(['commit-tree', tree, '-m', 'leak-gate scan']).trim() : sha
+  const blobs = historyBlobs(scanRef)
+  const commits = snapshot ? 1 : Number(git(['rev-list', '--count', sha]).trim())
+  let denylist = []
+  try { denylist = parseDenylist(fs.readFileSync(P.leakDenylist, 'utf8')) } catch {}
+  const scan = mirrorScan(blobs, { denylist })
+  if (!scan.ok) {
+    console.error(`LEAK GATE BLOCKED ${prefix} — ${scan.findings.length} finding(s) across ${commits} commit(s)${snapshot ? ' (snapshot tree)' : ''}. Nothing was pushed.`)
+    for (const f of scan.findings.slice(0, 50)) console.error(`  ${f.kind.padEnd(8)} ${f.rule.padEnd(18)} ${f.path}${f.line ? `:${f.line}` : ''}  ${f.excerpt}`)
+    if (scan.findings.length > 50) console.error(`  … and ${scan.findings.length - 50} more`)
+    console.error(snapshot
+      ? 'Fix the file, or mark a deliberate fake `leakgate:allow`.'
+      : 'History is scanned, not just the tree: a removed secret must be rewritten out, or the line marked `leakgate:allow` if it is a deliberate fake.')
+    logLine(`MIRROR BLOCKED ${prefix} — ${scan.findings.length} finding(s)`)
+    process.exit(1)
+  }
+  console.log(`leak gate: clean — ${blobs.length} blob(s) across ${commits} commit(s)${snapshot ? ' (snapshot tree)' : ''}, denylist ${denylist.length} term(s)`)
+  if (flags['dry-run'] && !snapshot) { console.log(`split ${sha} (dry run — not pushed)`); return }
+
+  let pushRef = sha
+  if (snapshot) {
+    let parent = null
+    if (remote) {
+      try { git(['fetch', '--quiet', remote, `refs/heads/${branch}`]); parent = git(['rev-parse', 'FETCH_HEAD']).trim() } catch { parent = null }
+    }
+    if (parent && git(['rev-parse', `${parent}^{tree}`]).trim() === tree) {
+      console.log(`${remote} ${branch} already matches ${prefix} — nothing to publish`)
+      return
+    }
+    const head = git(['rev-parse', '--short', 'HEAD']).trim()
+    pushRef = git(['commit-tree', tree, ...(parent ? ['-p', parent] : []),
+      '-m', `Publish ${path.basename(prefix)} from the monorepo (${head})`]).trim()
+    if (flags['dry-run']) {
+      console.log(`snapshot ${pushRef.slice(0, 10)} on ${parent ? parent.slice(0, 10) : '(new branch)'} (dry run — not pushed)`)
+      return
+    }
+  }
+  try {
+    git(['push', ...(flags.force ? ['--force'] : []), remote, `${pushRef}:refs/heads/${branch}`])
+  } catch (e) {
+    console.error(`push failed: ${(e.stderr || e.message).toString().trim().split('\n').slice(-3).join(' | ')}`)
+    console.error(flags.force || snapshot ? '' : 'The public repo has a different history: use --snapshot (adds one commit) or --force (replaces it).')
+    process.exit(1)
+  }
+  const sha_ = pushRef
+  logLine(`MIRROR pushed ${prefix} ${sha_.slice(0, 10)} → ${remote} ${branch}${snapshot ? ' (snapshot)' : ''}`)
+  console.log(`pushed ${sha_.slice(0, 10)} → ${remote} (${branch})${snapshot ? ' — snapshot on top of the public history' : ''}`)
+}
+
 // ─────────────────────────────────────────────────────────────── dispatch
 const [cmd, ...rest] = process.argv.slice(2)
 switch (cmd) {
   case 'tick': await cmdTick(); break
   case 'hook': await cmdHook(); break
   case 'ui': await cmdUi(); break
-  case 'chat': case 'attach': await cmdChat(rest); break
+  case 'chat': await cmdChat(rest); break
+  case 'attach': await cmdChat(rest, { takeOver: true }); break
   case 'say': say(rest.join(' ')); console.log('queued for delivery'); break
   case 'sprint': await cmdSprint(); break
   case 'brief': cmdBrief(rest); break
   case 'commit': await cmdCommit(rest); break
   case 'ask': cmdAsk(rest); break
   case 'approvals': cmdApprovals(); break
-  case 'approve': cmdAnswer('approved', rest); break
-  case 'reject': cmdAnswer('rejected', rest); break
+  case 'approve': humanOnly('harness approve'); cmdAnswer('approved', rest); break
+  case 'reject': humanOnly('harness reject'); cmdAnswer('rejected', rest); break
   case 'budget': cmdBudget(rest[0]); break
   case 'status': cmdStatus(); break
   case 'usage': cmdUsage(process.argv.slice(3)); break
   case 'pause': ensureDirs(); fs.writeFileSync(P.paused, ''); console.log('paused'); break
-  case 'resume': fs.rmSync(P.paused, { force: true }); console.log('resumed'); break
+  case 'resume': humanOnly('harness resume'); fs.rmSync(P.paused, { force: true }); console.log('resumed'); break
   case 'start': cmdStart(); break
   case 'stop': cmdStop(); break
   case 'install': cmdInstall(); break
+  case 'units': cmdUnits(rest); break
+  case 'gate': cmdGate(); break
+  case 'run': await cmdRun(rest); break
+  case 'runner': cmdRunnerStatus(); break
+  case 'history': cmdHistory(rest[0]); break
+  case 'mcp': await cmdMcp(); break
+  case 'notify': cmdNotify(rest); break
+  case 'mirror': cmdMirror(rest); break
   default:
     console.log(`usage: harness <command>
 
@@ -2549,6 +3143,17 @@ switch (cmd) {
   usage           live cost meter — window, credits, tokens, cache (--json)
   pause | resume  skip ticks without unloading launchd
   start | stop    load / unload the launchd job
-  install         (re)write the launchd plist from CONFIG`)
+  install         (re)write the launchd plist from CONFIG
+
+  v2 — the factory
+  run [--until-idle]   event-driven runner: next unit starts when the last one passes
+  units [check|approve <id>|retry <id>]   the unit queue and what each unit waits on
+  runner          what the runner is doing now
+  attach          take over the live session (waits for it to land; autonomy pauses)
+  history [n]     recent run log + notifications
+  gate            this provider's go/no-go as JSON (the runner asks each provider)
+  mcp             control-tower MCP server (stdio) for Claude Code / Codex chats
+  notify [test]   notification channels; test sends one
+  mirror <prefix> [--remote url] [--dry-run]   leak-gated public mirror push`)
     process.exit(cmd ? 1 : 0)
 }

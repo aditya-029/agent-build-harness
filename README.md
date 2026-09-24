@@ -330,11 +330,56 @@ The agent files a request with `harness ask` and is told explicitly **not** to b
 The queue is append-only — an answer is a new line, never an edit — so two terminals
 answering at once cannot clobber each other.
 
+## v2: a factory, not a timer
+
+The launchd scheduler above wakes on an interval. v2 adds an event-driven runner that works
+through an approved **unit queue** and is steered from any chat.
+
+```bash
+harness units                 # the queue: owner, status, what each unit waits on
+harness run                   # build agent units in order until stopped
+harness attach                # take over the live session (it lands first; autonomy pauses)
+harness mcp                   # control-tower MCP server for Claude Code / Codex chats
+harness mirror <prefix> --dry-run   # leak-gated public mirror of a monorepo folder
+```
+
+- **Unit queue** (`unitsPath`, JSON). Every unit has an owner (`agent` or `adi`),
+  dependencies, and a runnable acceptance command. A unit without that command is refused
+  when the queue loads. `adi` units are never started. Agent units that depend on one wait,
+  and the runner picks something else in the meantime. `approval` gates a unit until
+  `harness units approve <id>`.
+- **Runner**. The next unit starts the moment the last one's acceptance command passes, with
+  no interval. Each provider is asked for its own go/no-go (`harness gate`). If Claude's
+  window is spent the unit goes to Codex. If both are spent, the runner parks until the
+  **earliest** reset. Codex headroom is read live from its own session rollouts. When no
+  reading exists, the gate reports "unknown", never zero. An attempt cut short by a spent
+  window doesn't count against the unit's `maxAttempts`.
+- **Control tower**. The MCP tools are `status`, `history`, `steer`, `approvals`, `approve`,
+  `reject`, `pause`, `resume`, `units` and `approve_unit`. Build sessions run with
+  `HARNESS_AGENT_SESSION=1`, and the operator-only actions refuse under it, whether they come
+  through MCP or the CLI. Codex build sessions also run with the tower switched off, so an
+  agent can't approve its own request.
+- **Attach**. `harness attach` asks the running session to land, holds the runner, waits for
+  the tick to exit, and then opens the provider TUI on that session. The runner resumes on
+  detach. `chat` keeps the v1 behaviour and refuses while a tick is live.
+- **Notifications** (`~/.config/harness/notify.json`, outside the repo). Approval, failure,
+  blocked and parked events push immediately. A finished unit is batched, so three quick
+  finishes arrive as one push. Routine progress only goes to the log. Channels are
+  macOS (default), ntfy, and Telegram (the token is read from a file).
+- **Mirrors**. `git subtree split` of a folder. The leak gate scans **every blob in history**
+  for secrets, home paths, phone numbers and a private denylist. A secret deleted in a later
+  commit still blocks the push. Deliberate fakes carry `leakgate:allow`. Dry runs are open to
+  agents; pushing is operator-only. `--snapshot` (or `"mode": "snapshot"`) instead publishes the
+  folder's current tree as one commit on top of the public branch. Nothing public is rewritten,
+  and only that tree is scanned. This is the mode for a public repo whose history predates the
+  monorepo.
+
 ## Tests
 
 ```bash
 npm test
 npm run test:stress
+npm run test:v2      # units, runner, tower, attach, notifications, mirror — fake providers
 ```
 
 Three things worth noting about the suite:

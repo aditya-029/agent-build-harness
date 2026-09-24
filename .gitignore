@@ -2,3 +2,6 @@ node_modules/
 .DS_Store
 # Harness runtime state, when the harness is pointed at THIS repo.
 .harness/
+
+# ECC release quarantine and promoted reference copies (docs/ecc/ holds the tracked reports).
+vendor/

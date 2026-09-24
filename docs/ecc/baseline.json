@@ -1,0 +1,42 @@
+{
+ "tag": "v2.2.1",
+ "reviewedAt": "2026-09-24T08:16:46.985Z",
+ "reviewedKeys": [
+  "curl-pipe-shell:tests/lib/shell-substitution.test.js:a72cf618ed6c",
+  "eval-dynamic:.opencode/tools/security-audit.ts:a475ee49c7ac",
+  "eval-dynamic:scripts/sync-ecc-to-codex.sh:a475ee49c7ac",
+  "network:integrations/aura/adapter.py:c29c51887f9b",
+  "network:scripts/discord/ecc-bot.mjs:5911a3481ee5",
+  "network:scripts/discord/register-commands.mjs:4c16ac258bd6",
+  "network:scripts/discord/release-announce.mjs:4c16ac258bd6",
+  "network:scripts/hooks/plan-canvas-pending.js:3676d42cc0aa",
+  "network:scripts/lib/control-pane/proximity-viz.js:4c16ac258bd6",
+  "network:scripts/lib/control-pane/ui.js:47bae5a215e8",
+  "network:scripts/lib/nasiko-release.js:a110109d6013",
+  "network:scripts/lib/plan-canvas/ui.js:1070dc884c69",
+  "network:scripts/plan-canvas.js:2c9f4cafa149",
+  "network:skills/continuous-learning-v2/scripts/instinct-cli.py:c29c51887f9b",
+  "network:skills/ios-icon-gen/scripts/iconify_gen.sh:dc0d221e2a4f",
+  "network:src/llm/providers/ollama.py:c29c51887f9b",
+  "secret-paths:ecc2/src/observability/mod.rs:f40883a1267f",
+  "secret-paths:scripts/hooks/governance-capture.js:f40883a1267f",
+  "secret-paths:scripts/ito.js:1177a95c6029",
+  "unpinned-npx:.codex/config.toml:85a8dff4ec84",
+  "unpinned-npx:.mcp.json:d1f06b075a5c",
+  "unpinned-npx:mcp-configs/mcp-servers.json:5c8e48f08ccd",
+  "unpinned-npx:skills/angular-developer/SKILL.md:28b72e535e9a",
+  "unpinned-npx:the-shortform-guide.md:4df861e3ad7f"
+ ],
+ "hooksHash": "42376cf51c9453d0",
+ "dependencies": {
+  "@iarna/toml": "2.2.5",
+  "ajv": "8.20.0",
+  "js-yaml": "4.3.1",
+  "sql.js": "1.14.2"
+ },
+ "unknownFiles": [
+  ".env.example",
+  ".kiro/settings/mcp.json.example",
+  "docs/releases/2.1.0/assets/ecc-plan-canvas-demo.webm"
+ ]
+}
